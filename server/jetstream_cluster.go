@@ -3765,6 +3765,73 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	}
 }
 
+// selectPeerToRemove picks a peer from remaining to remove during scale-down.
+// Priority order (most-likely-safe to remove first):
+//  1. offline: oldest first
+//  2. not current: online but not current (not required for quorum)
+//  3. current: online and caught up
+func (s *Server) selectPeerToRemove(n RaftNode, remaining []string) string {
+	if len(remaining) == 0 {
+		return _EMPTY_
+	}
+
+	const (
+		tierOffline       = iota // server is offline
+		tierNotCurrent           // online but raft state is behind / not caught up
+		tierOnlineCurrent        // online and caught up
+		tierUnset                // sentinel: no candidate evaluated yet
+	)
+
+	peers := make(map[string]*Peer, len(remaining))
+	for _, p := range n.Peers() {
+		peers[p.ID] = p
+	}
+
+	now := time.Now()
+	best, bestTier := _EMPTY_, tierUnset
+	var bestLast time.Time
+
+	for _, id := range remaining {
+		rp := peers[id]
+
+		// Unknown peers are treated as offline, matching how other cluster code does it.
+		offline := true
+		if sir, ok := s.nodeToInfo.Load(id); ok && sir != nil {
+			offline = sir.(nodeInfo).offline
+		}
+
+		tier := tierOnlineCurrent
+		var last time.Time
+		switch {
+		case offline:
+			tier = tierOffline
+			if rp != nil {
+				last = rp.Last
+			}
+		case rp == nil:
+			tier = tierNotCurrent
+		default:
+			current := rp.Current
+			// Mirror clusterInfo's view: a "current" peer we haven't heard from
+			// in lostQuorumInterval is treated as not current.
+			if current && !rp.Last.IsZero() && now.Sub(rp.Last) > lostQuorumInterval {
+				current = false
+			}
+			if !current {
+				tier = tierNotCurrent
+			}
+		}
+
+		// Lower tier wins. Within tierOffline, the earlier Last wins — and
+		// time.Time's zero value is "before" any real time, so never-seen peers
+		// naturally sort ahead of peers we have heard from.
+		if tier < bestTier || (tier == tierOffline && bestTier == tierOffline && last.Before(bestLast)) {
+			best, bestTier, bestLast = id, tier, last
+		}
+	}
+	return best
+}
+
 // TODO(mvv): docs
 func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode) bool {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
@@ -3838,9 +3905,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 				}
 
 				js.mu.RUnlock()
-				// TODO(mvv): removes a random peer, should instead remove non-current first
-				//  to increase chances we're not bricking ourselves.
-				n.ProposeRemovePeer(remaining[0])
+				n.ProposeRemovePeer(s.selectPeerToRemove(n, remaining))
 				return false
 			}
 		}
@@ -4005,9 +4070,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 			// If the peer sets are an exact match, we can remove a peer.
 			if slices.Equal(current, actual) {
 				js.mu.RUnlock()
-				// TODO(mvv): removes a random peer, should instead remove non-current first
-				//  to increase chances we're not bricking ourselves.
-				n.ProposeRemovePeer(remaining[0])
+				n.ProposeRemovePeer(s.selectPeerToRemove(n, remaining))
 				return false
 			}
 		}
