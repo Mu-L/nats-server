@@ -3379,17 +3379,17 @@ func TestJetStreamSuperClusterTagInducedMoveCancel(t *testing.T) {
 		require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
 		return nil
 	})
-	if cancelResp.Error != nil && ErrorIdentifier(cancelResp.Error.ErrCode) == JSStreamMoveNotInProgress {
-		t.Skip("This can happen with delays, when Move completed before Cancel", cancelResp.Error)
-		return
-	}
 	require_True(t, cancelResp.Error == nil)
 
 	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
 		si, err := js.StreamInfo("TEST")
 		require_NoError(t, err)
-		if si.Config.Placement != nil {
-			return fmt.Errorf("expected placement to be cleared got: %+v", si.Config.Placement)
+		// Canceling restores the pre-move state, including the original placement.
+		if p := si.Config.Placement; p == nil || len(p.Tags) != 1 || p.Tags[0] != "C1" {
+			return fmt.Errorf("expected placement to be restored to [C1] got: %+v", p)
+		}
+		if si.Cluster.Name != "C1" {
+			return fmt.Errorf("expected stream to remain in C1 got: %s", si.Cluster.Name)
 		}
 		return nil
 	})
@@ -3527,10 +3527,6 @@ func TestJetStreamSuperClusterMoveCancel(t *testing.T) {
 		require_NoError(t, err)
 		var cancelResp JSApiStreamUpdateResponse
 		require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
-		if cancelResp.Error != nil && ErrorIdentifier(cancelResp.Error.ErrCode) == JSStreamMoveNotInProgress {
-			t.Skip("This can happen with delays, when Move completed before Cancel", cancelResp.Error)
-			return
-		}
 		require_True(t, cancelResp.Error == nil)
 
 		for _, sExpected := range streamPeerSrv {

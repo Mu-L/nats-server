@@ -2775,26 +2775,68 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 		return
 	}
 
-	streamFound := false
-	cfg := StreamConfig{}
-	currPeers := []string{}
 	js.mu.Lock()
-	streams, ok := cc.streams[accName]
-	if ok {
-		sa, ok := streams[streamName]
-		if ok {
-			cfg = *sa.Config.clone()
-			streamFound = true
-			currPeers = sa.Group.Peers
-		}
+	if cc.meta == nil {
+		js.mu.Unlock()
+		return
 	}
-	js.mu.Unlock()
 
-	if !streamFound {
+	var sa *streamAssignment
+	if streams, ok := cc.streams[accName]; ok {
+		sa = streams[streamName]
+	}
+	if sa == nil {
+		js.mu.Unlock()
 		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+
+	// With desired state tracking a move is in progress when the stream has a desired
+	// placement configured. Canceling simply drops it and keeps the current peer set,
+	// proposing the change at the meta layer and tracking it like any other update.
+	if sa.DesiredPlacement != nil {
+		restorePeers := copyStrings(sa.Group.Peers)
+		nsa := sa.copyGroup()
+		nsa.Reply = _EMPTY_
+		nsa.DesiredPlacement = nil
+		proposeErr := cc.meta.Propose(encodeUpdateStreamAssignment(nsa))
+		if proposeErr == nil {
+			cc.trackInflightStreamProposal(accName, nsa, false)
+			// Cancel any consumer moves that were started as part of this stream move too,
+			// otherwise they would keep migrating to the new peer set.
+			for _, ca := range sa.consumers {
+				if ca.DesiredPlacement == nil {
+					continue
+				}
+				nca := ca.copyGroup()
+				nca.Reply = _EMPTY_
+				nca.DesiredPlacement = nil
+				if err := cc.meta.Propose(encodeAddConsumerAssignment(nca)); err == nil {
+					cc.trackInflightConsumerProposal(accName, streamName, nca, false)
+				}
+			}
+		}
+		js.mu.Unlock()
+
+		if proposeErr != nil {
+			resp.Error = NewJSClusterNotAvailError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+
+		s.Noticef("Requested cancel of move for stream '%s > %s', restoring peer set %+v",
+			accName, streamName, s.peerSetToNames(restorePeers))
+
+		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	// No desired placement, fall back to the previous behavior. This handles moves that
+	// inflated the peer set instead of using desired state tracking.
+	cfg := *sa.Config.clone()
+	currPeers := sa.Group.Peers
+	js.mu.Unlock()
 
 	if len(currPeers) <= cfg.Replicas {
 		resp.Error = NewJSStreamMoveNotInProgressError()
