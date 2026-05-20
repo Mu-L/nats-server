@@ -951,7 +951,7 @@ func (ms *memStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPerS
 	var havePartial bool
 	var totalSkipped uint64
 	// We will track start and end sequences as we go.
-	stree.IntersectGSL[SimpleState](ms.fss, sl, func(subj []byte, fss *SimpleState) {
+	stree.IntersectGSL[SimpleState](ms.fss, sl, func(subj []byte, fss *SimpleState) bool {
 		if fss.firstNeedsUpdate || fss.lastNeedsUpdate {
 			ms.recalculateForSubj(bytesToString(subj), fss)
 		}
@@ -965,6 +965,7 @@ func (ms *memStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPerS
 		} else {
 			totalSkipped += fss.Msgs
 		}
+		return true
 	})
 
 	// If we did not encounter any partials we can return here.
