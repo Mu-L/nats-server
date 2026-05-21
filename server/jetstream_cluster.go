@@ -1251,7 +1251,7 @@ func (cc *jetStreamCluster) isStreamAssigned(a *Account, stream string) bool {
 	if sa == nil {
 		return false
 	}
-	return sa.Group.isMemberOrDesired(cc.meta.ID())
+	return sa.Group.isMember(cc.meta.ID())
 }
 
 // Read lock should be held.
@@ -2561,7 +2561,7 @@ func (js *jetStream) processRemovePeer(peer string) {
 		if sa.unsupported != nil {
 			continue
 		}
-		if rg := sa.Group; rg.isMember(peer) {
+		if rg := sa.Group; rg.isCurrentMember(peer) {
 			js.removePeerFromStreamLocked(sa, peer)
 		}
 	}
@@ -2576,7 +2576,7 @@ func (js *jetStream) removePeerFromStream(sa *streamAssignment, peer string) boo
 
 // Lock should be held.
 func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer string) bool {
-	if rg := sa.Group; !rg.isMember(peer) {
+	if rg := sa.Group; !rg.isCurrentMember(peer) {
 		return false
 	}
 
@@ -2604,7 +2604,7 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 			cca.Group.Peers, cca.Group.Preferred = rg.Peers, _EMPTY_
 			cc.meta.Propose(encodeAddConsumerAssignment(cca))
 			cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
-		} else if ca.Group.isMember(peer) {
+		} else if ca.Group.isCurrentMember(peer) {
 			// These are ephemerals. Check to see if we deleted this peer.
 			cc.meta.Propose(encodeDeleteConsumerAssignment(ca))
 			cc.trackInflightConsumerProposal(accName, csa.Config.Name, ca, true)
@@ -2785,26 +2785,37 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, ru *recoveryUpdates) (bo
 	return isRecovering, didSnap, nil
 }
 
+// isMember reports whether id is in the current or desired peer set.
+func (rg *raftGroup) isMember(id string) bool {
+	if rg == nil {
+		return false
+	}
+	if rg.isCurrentMember(id) {
+		return true
+	}
+	if d := rg.Desired; d != nil && d.Group != nil && d.Group.isCurrentMember(id) {
+		return true
+	}
+	return false
+}
+
 // isGroupMember reports whether this server is a member of rg's current or
 // desired peer set.
 func (cc *jetStreamCluster) isGroupMember(rg *raftGroup) bool {
 	if cc == nil || cc.meta == nil {
 		return false
 	}
-	return rg.isMemberOrDesired(cc.meta.ID())
+	return rg.isMember(cc.meta.ID())
 }
 
-// isMemberOrDesired reports whether id is in the current peer set or, while a
-// move/scale is in flight, in the desired peer set.
-func (rg *raftGroup) isMemberOrDesired(id string) bool {
+func (rg *raftGroup) isCurrentMember(id string) bool {
 	if rg == nil {
 		return false
 	}
-	if rg.isMember(id) {
-		return true
-	}
-	if d := rg.Desired; d != nil && d.Group != nil && d.Group.isMember(id) {
-		return true
+	for _, peer := range rg.Peers {
+		if peer == id {
+			return true
+		}
 	}
 	return false
 }
@@ -2824,18 +2835,6 @@ func (rg *raftGroup) combinePeersWithDesired() []string {
 		}
 	}
 	return peerSet
-}
-
-func (rg *raftGroup) isMember(id string) bool {
-	if rg == nil {
-		return false
-	}
-	for _, peer := range rg.Peers {
-		if peer == id {
-			return true
-		}
-	}
-	return false
 }
 
 func (rg *raftGroup) setPreferred(s *Server) {
@@ -2889,11 +2888,11 @@ func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, recovering b
 	}
 
 	ourID := cc.meta.ID()
-	isMember := rg.isMember(ourID)
+	isMember := rg.isCurrentMember(ourID)
 	peerSet := rg.combinePeersWithDesired()
 	name, preferred, scaleUp := rg.Name, rg.Preferred, rg.ScaleUp
 	if desired := rg.Desired; desired != nil && desired.Group != nil {
-		isMember = isMember || desired.Group.isMember(ourID)
+		isMember = isMember || desired.Group.isCurrentMember(ourID)
 		// Note that the group name MUST NOT be different normally.
 		// However, when scaling up from R1 we've renamed it to mark a distinct replicated group.
 		preferred, scaleUp = desired.Group.Preferred, desired.Group.ScaleUp
@@ -4673,7 +4672,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				shouldRemove := true
 				if sa := mset.streamAssignment(); sa != nil && sa.Group != nil {
 					js.mu.RLock()
-					shouldRemove = !sa.Group.isMemberOrDesired(ourID)
+					shouldRemove = !sa.Group.isMember(ourID)
 					js.mu.RUnlock()
 				}
 				if shouldRemove {
@@ -6779,7 +6778,7 @@ func (cc *jetStreamCluster) isConsumerAssigned(a *Account, stream, consumer stri
 	if ca == nil {
 		return false
 	}
-	return ca.Group.isMemberOrDesired(cc.meta.ID())
+	return ca.Group.isMember(cc.meta.ID())
 }
 
 // Returns our stream and underlying raft node.
@@ -7093,7 +7092,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 				shouldRemove := true
 				if ca := o.consumerAssignment(); ca != nil && ca.Group != nil {
 					js.mu.RLock()
-					shouldRemove = !ca.Group.isMemberOrDesired(ourID)
+					shouldRemove = !ca.Group.isMember(ourID)
 					js.mu.RUnlock()
 				}
 				if shouldRemove {
@@ -8856,7 +8855,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 				var needReplace []string
 				for _, rp := range ca.Group.Peers {
 					// Check if we have an orphaned peer now for this consumer.
-					if !rg.isMember(rp) {
+					if !rg.isCurrentMember(rp) {
 						needReplace = append(needReplace, rp)
 					}
 				}
