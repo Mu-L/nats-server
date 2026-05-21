@@ -3852,8 +3852,6 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 			return false
 		}
 
-		//isMoveRequest := sa.Group.Desired.Placement != nil
-		current := copyStrings(sa.Group.Peers)
 		actual := n.PeerNames()
 		desired := sa.Group.Desired.Group.Peers
 		foundAll := true
@@ -3876,6 +3874,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 			}
 		}
 		if len(remaining) > 0 {
+			current := copyStrings(sa.Group.Peers)
 			slices.Sort(current)
 			slices.Sort(actual)
 			// If the peer sets are an exact match, we can remove a peer.
