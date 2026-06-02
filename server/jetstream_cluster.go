@@ -8738,6 +8738,17 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// Reset notion of scaling up, if this was done in a previous update.
 	rg.ScaleUp = false
+
+	populateConsumerWithDesired := func(ca, cca *consumerAssignment) {
+		desiredGroup := cca.Group
+		desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+		cca.Group = ca.Group.copyGroup()
+		cca.Group.Desired = &desiredGroupPlacement{
+			ID:    nuid.Next(),
+			Group: desiredGroup,
+		}
+	}
+
 	if isReplicaChange {
 		isScaleUp := newCfg.Replicas > len(rg.Peers)
 		// We are adding new peers here.
@@ -8828,14 +8839,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 					cca.Config.Replicas = len(rg.Peers)
 				}
 
-				// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
-				desiredGroup := cca.Group
-				desiredGroup.Desired = nil // leaf invariant: desired groups never nest
-				cca.Group = ca.Group.copyGroup()
-				cca.Group.Desired = &desiredGroupPlacement{
-					ID:    nuid.Next(),
-					Group: desiredGroup,
-				}
+				populateConsumerWithDesired(ca, cca)
 
 				// We can not propose here before the stream itself so we collect them.
 				consumers = append(consumers, cca)
@@ -8870,14 +8874,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 						cca.Config.Replicas = len(newPeers)
 					}
 
-					// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
-					desiredGroup := cca.Group
-					desiredGroup.Desired = nil // leaf invariant: desired groups never nest
-					cca.Group = ca.Group.copyGroup()
-					cca.Group.Desired = &desiredGroupPlacement{
-						ID:    nuid.Next(),
-						Group: desiredGroup,
-					}
+					populateConsumerWithDesired(ca, cca)
 
 					// We can not propose here before the stream itself so we collect them.
 					consumers = append(consumers, cca)
@@ -8928,15 +8925,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			} else {
 				cca.Group.Peers = append(dropPeerSet, cPeerSet...)
 			}
-
-			// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
-			desiredGroup := cca.Group
-			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
-			cca.Group = ca.Group.copyGroup()
-			cca.Group.Desired = &desiredGroupPlacement{
-				ID:    nuid.Next(),
-				Group: desiredGroup,
-			}
+			populateConsumerWithDesired(ca, cca)
 
 			// make sure it overlaps with peers and remove if not
 			if cca.Group.Preferred != _EMPTY_ {
