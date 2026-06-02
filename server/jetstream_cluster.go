@@ -2892,14 +2892,18 @@ func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, recovering b
 	peerSet := rg.combinePeersWithDesired()
 	name, preferred, scaleUp := rg.Name, rg.Preferred, rg.ScaleUp
 	if desired := rg.Desired; desired != nil && desired.Group != nil {
-		isMember = isMember || desired.Group.isCurrentMember(ourID)
 		// Note that the group name MUST NOT be different normally.
 		// However, when scaling up from R1 we've renamed it to mark a distinct replicated group.
-		preferred, scaleUp = desired.Group.Preferred, desired.Group.ScaleUp
 		// If scaling down to R1, we keep the original group while the desired state is populated.
 		if len(desired.Group.Peers) > 1 {
 			name = desired.Group.Name
 		}
+		preferred = desired.Group.Preferred
+		// While a move/scale is inflight, peers only part of the desired set are scaled up.
+		// This ensures a new peer with an empty log can't become leader until it's caught up
+		// by the current peer set.
+		scaleUp = !isMember
+		isMember = isMember || desired.Group.isCurrentMember(ourID)
 	}
 
 	// If this is a single peer raft group or we are not a member return.
@@ -8742,6 +8746,13 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	populateConsumerWithDesired := func(ca, cca *consumerAssignment) {
 		desiredGroup := cca.Group
 		desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+		// When scaling up from a single replica, set it as preferred, as it has the data.
+		if len(ca.Group.Peers) == 1 {
+			desiredGroup.Preferred = ca.Group.Peers[0]
+		} else if desiredGroup.Preferred != _EMPTY_ && !slices.Contains(desiredGroup.Peers, desiredGroup.Preferred) {
+			// Don't carry a stale preferred into the desired group.
+			desiredGroup.Preferred = _EMPTY_
+		}
 		cca.Group = ca.Group.copyGroup()
 		cca.Group.Desired = &desiredGroupPlacement{
 			ID:    nuid.Next(),
