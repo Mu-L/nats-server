@@ -24427,3 +24427,35 @@ func TestJetStreamJSAckSuffixCorruption(t *testing.T) {
 	receiver.route = &route{}
 	require_NoError(t, receiver.parse(frame))
 }
+
+func TestJetStreamSourceHeaderNotAllowedIfNotSourced(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		var s *Server
+		if replicas == 1 {
+			s = RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+		} else {
+			c := createJetStreamClusterExplicit(t, "R3S", replicas)
+			defer c.shutdown()
+			s = c.randomServer()
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		m := nats.NewMsg("foo")
+		m.Header.Set("Nats-Stream-Source", "bar")
+		_, err = js.PublishMsg(m)
+		require_Error(t, err, NewJSMessageSourceHdrNotAllowedError())
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}

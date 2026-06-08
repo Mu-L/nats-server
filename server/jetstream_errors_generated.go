@@ -368,6 +368,9 @@ const (
 	// JSMessageSchedulesTimeZoneInvalidErr message schedules time zone is invalid
 	JSMessageSchedulesTimeZoneInvalidErr ErrorIdentifier = 10223
 
+	// JSMessageSourceHdrNotAllowedErr message stream source header is not allowed
+	JSMessageSourceHdrNotAllowedErr ErrorIdentifier = 10224
+
 	// JSMessageTTLDisabledErr per-message TTL is disabled
 	JSMessageTTLDisabledErr ErrorIdentifier = 10166
 
@@ -795,6 +798,7 @@ var (
 		JSMessageSchedulesTTLInvalidErr:              {Code: 400, ErrCode: 10191, Description: "message schedules invalid per-message TTL"},
 		JSMessageSchedulesTargetInvalidErr:           {Code: 400, ErrCode: 10190, Description: "message schedules target is invalid"},
 		JSMessageSchedulesTimeZoneInvalidErr:         {Code: 400, ErrCode: 10223, Description: "message schedules time zone is invalid"},
+		JSMessageSourceHdrNotAllowedErr:              {Code: 400, ErrCode: 10224, Description: "message stream source header is not allowed"},
 		JSMessageTTLDisabledErr:                      {Code: 400, ErrCode: 10166, Description: "per-message TTL is disabled"},
 		JSMessageTTLInvalidErr:                       {Code: 400, ErrCode: 10165, Description: "invalid per-message TTL"},
 		JSMirrorConsumerRequiresAckFCErr:             {Code: 400, ErrCode: 10214, Description: "stream mirror consumer requires flow control ack policy"},
@@ -2225,6 +2229,16 @@ func NewJSMessageSchedulesTimeZoneInvalidError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSMessageSchedulesTimeZoneInvalidErr]
+}
+
+// NewJSMessageSourceHdrNotAllowedError creates a new JSMessageSourceHdrNotAllowedErr error: "message stream source header is not allowed"
+func NewJSMessageSourceHdrNotAllowedError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageSourceHdrNotAllowedErr]
 }
 
 // NewJSMessageTTLDisabledError creates a new JSMessageTTLDisabledErr error: "per-message TTL is disabled"
