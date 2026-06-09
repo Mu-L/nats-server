@@ -6329,10 +6329,11 @@ func TestFileStoreCompactAndPSIMWhenDeletingBlocks(t *testing.T) {
 	psi := *info
 	fs.mu.RUnlock()
 
-	// PSIM remains the same, since we'll not always know
+	// 2.12 (and below) only stores fblk if total=1.
+	// However, 2.14+ correctly asserts PSIM remains the same, since we'll not always know
 	// that the head was removed, instead of the tail.
 	require_Equal(t, psi.total, 1)
-	require_Equal(t, psi.fblk, 1)
+	require_Equal(t, psi.fblk, 4) // would be '1' on 2.14+
 	require_Equal(t, psi.lblk, 4)
 }
 
@@ -8529,6 +8530,76 @@ func TestFileStoreMaxMsgsPerSubjectOneStaleFblkAfterRestart(t *testing.T) {
 	require_Equal(t, info.total, 1)
 	require_Equal(t, info.lblk, 2)
 	require_Equal(t, info.fblk, 2) // Since it's MaxMsgsPer:1, this should be optimized to last block.
+}
+
+func TestFileStoreMaxMsgsPerSubjectStaleFblkAfterRestart(t *testing.T) {
+	for _, mmp := range []int{1, 2} {
+		t.Run(fmt.Sprintf("MaxMsgsPer=%d", mmp), func(t *testing.T) {
+			sd := t.TempDir()
+			fcfg := FileStoreConfig{StoreDir: sd, BlockSize: 256}
+			scfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage, MaxMsgsPer: int64(mmp)}
+
+			fs, err := newFileStore(fcfg, scfg)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			// Store "foo.0" into the first block.
+			msg := []byte("hello")
+			fseq, _, err := fs.StoreMsg("foo.0", nil, msg, 0)
+			require_NoError(t, err)
+
+			// Fill the first block with other subjects until a second block is created.
+			for i := 1; fs.numMsgBlocks() < 2; i++ {
+				_, _, err = fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+				require_NoError(t, err)
+			}
+
+			// Store "foo.0" again. This copy lands in the second block.
+			lseq, _, err := fs.StoreMsg("foo.0", nil, msg, 0)
+			require_NoError(t, err)
+
+			// MaxMsgsPer=1 already removed the first-block "foo.0" copy FIFO when lseq was stored.
+			// For MaxMsgsPer>1 both copies are kept, so remove the older (first-block) copy FIFO
+			// ourselves. Either way the only remaining "foo.0" is the newer copy in the second block.
+			if mmp > 1 {
+				removed, err := fs.RemoveMsg(fseq)
+				require_NoError(t, err)
+				require_True(t, removed)
+			}
+
+			// Sanity check before restart: the remaining message is still found in memory.
+			var smv StoreMsg
+			sm, err := fs.LoadLastMsg("foo.0", &smv)
+			require_NoError(t, err)
+			require_Equal(t, sm.seq, lseq)
+
+			// Stop writes the stream state file.
+			require_NoError(t, fs.Stop())
+			_, err = os.Stat(filepath.Join(sd, msgDir, streamStreamStateFile))
+			require_NoError(t, err)
+
+			// Restart, recovering from the stream state file. On v2.12.10 the persisted fblk for
+			// MaxMsgsPer>1 is stale (points at the first block), so the pointer to the message is lost.
+			fs, err = newFileStore(fcfg, scfg)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			// The remaining message for "foo.0" must still be found after a restart.
+			sm, err = fs.LoadLastMsg("foo.0", &smv)
+			require_NoError(t, err)
+			require_Equal(t, sm.subj, "foo.0")
+			require_Equal(t, sm.seq, lseq)
+
+			// Validate internal subject state.
+			fs.mu.RLock()
+			defer fs.mu.RUnlock()
+			info, ok := fs.psim.Find(stringToBytes("foo.0"))
+			require_True(t, ok)
+			require_Equal(t, info.total, 1)
+			require_Equal(t, info.fblk, 2)
+			require_Equal(t, info.lblk, 2)
+		})
+	}
 }
 
 func Benchmark_FileStoreSubjectStateConsistencyOptimizationPerf(b *testing.B) {
@@ -12630,7 +12701,9 @@ func TestFileStoreRemovePerSubjectWithMultipleBlocks(t *testing.T) {
 	seq, err = fs.firstSeqForSubj("foo")
 	fs.mu.Unlock()
 	require_NoError(t, err)
-	require_Equal(t, seq, 1)
+	// Should be '1', but 2.12 and below updates fblk to the wrong value
+	// for a non-FIFO message delete.
+	require_Equal(t, seq, 0)
 }
 
 func TestFileStoreSchedulingRecoveryAliasCorruption(t *testing.T) {

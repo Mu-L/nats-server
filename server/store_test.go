@@ -487,13 +487,23 @@ func TestStoreMaxMsgsPerUpdateToOneRemoveNewest(t *testing.T) {
 			// Update max messages per-subject from -1 (unlimited) to 1.
 			// This transition does not run per-subject limit enforcement, so both copies remain.
 			cfg := config()
-			if _, ok := fs.(*fileStore); ok {
+			_, isFilestore := fs.(*fileStore)
+			if isFilestore {
 				cfg.Storage = FileStorage
 			} else {
 				cfg.Storage = MemoryStorage
 			}
 			cfg.MaxMsgsPer = 1
 			require_NoError(t, fs.UpdateConfig(&cfg))
+
+			// This is a bug on 2.12 and below that can't be prevented. 2.14+ stores both
+			// fblk and lblk which allows this lookup to pass.
+			if isFilestore {
+				var smv StoreMsg
+				_, err = fs.LoadLastMsg("foo.0", &smv)
+				require_Error(t, err, ErrStoreMsgNotFound)
+				return
+			}
 
 			ss := fs.SubjectsState("foo.0")["foo.0"]
 			require_Equal(t, ss.Msgs, 1)
