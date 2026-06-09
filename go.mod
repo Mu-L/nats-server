@@ -2,10 +2,10 @@ module github.com/nats-io/nats-server/v2
 
 go 1.25.0
 
-toolchain go1.25.10
+toolchain go1.25.11
 
 require (
-	github.com/antithesishq/antithesis-sdk-go v0.6.0-default-no-op
+	github.com/antithesishq/antithesis-sdk-go v0.7.0-default-no-op
 	github.com/google/go-tpm v0.9.8
 	github.com/klauspost/compress v1.18.6
 	github.com/minio/highwayhash v1.0.4
