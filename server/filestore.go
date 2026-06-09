@@ -4703,17 +4703,15 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 	}
 
 	// Adjust top level tracking of per subject msg counts.
-	var info *psi
-	var ok bool
 	if len(subj) > 0 && fs.psim != nil {
 		index := fs.lmb.index
-		if info, ok = fs.psim.Find(stringToBytes(subj)); ok {
+		if info, ok := fs.psim.Find(stringToBytes(subj)); ok {
 			info.total++
 			if index > info.lblk {
 				info.lblk = index
 			}
 		} else {
-			info, _ = fs.psim.Insert(stringToBytes(subj), psi{total: 1, fblk: index, lblk: index})
+			fs.psim.Insert(stringToBytes(subj), psi{total: 1, fblk: index, lblk: index})
 			fs.tsl += len(subj)
 		}
 	}
@@ -4758,10 +4756,6 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 				fs.rebuildStateLocked(ld)
 			}
 		}
-	}
-	// If we only ever store one/last message for a subject, can correct the first block to where we've just written.
-	if info != nil && info.total == 1 && mmp == 1 {
-		info.fblk = info.lblk
 	}
 
 	// Limits checks and enforcement.
@@ -5296,7 +5290,12 @@ func (fs *fileStore) removePerSubject(subj string) uint64 {
 	bsubj := stringToBytes(subj)
 	if info, ok := fs.psim.Find(bsubj); ok {
 		info.total--
-		if info.total == 0 {
+		if info.total == 1 {
+			// This is only correct if the last message for this subject still exists and was
+			// not removed. The 2.12 line can't handle this better sadly, 2.14+ persists both
+			// fblk and lblk, so it does not contain this block.
+			info.fblk = info.lblk
+		} else if info.total == 0 {
 			if _, ok = fs.psim.Delete(bsubj); ok {
 				fs.tsl -= len(subj)
 				return 0
