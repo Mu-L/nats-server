@@ -2363,8 +2363,16 @@ func TestWSCompressedPubInSingleFrame(t *testing.T) {
 	msg := natsNexMsg(t, sub, time.Second)
 	require_Equal(t, string(msg.Data), "a") // The compressed PUB payload should be delivered.
 	_, err = wsc.Write(testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("PING\r\n")))
-	require_NoError(t, err)                                      // A follow-up compressed PING should still be accepted on the same connection.
-	require_Equal(t, string(testWSReadFrame(t, br)), "PONG\r\n") // The connection should remain alive after the compressed frame.
+	require_NoError(t, err) // A follow-up compressed PING should still be accepted on the same connection.
+	// With such a low max_payload, the writer bounds compressed websocket
+	// messages to a few hundred bytes, so the post-CONNECT INFO and the
+	// PONG may arrive split across several messages. Read until the PONG
+	// to show the connection remains alive after the compressed frame.
+	var stream []byte
+	for i := 0; !bytes.HasSuffix(stream, []byte(pongProto)); i++ {
+		require_True(t, i < 10)
+		stream = append(stream, testWSReadFrame(t, br)...)
+	}
 }
 
 func TestWSCompressedSequentialFramesRemainResponsive(t *testing.T) {
@@ -3534,6 +3542,98 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 			}
 			if !bytes.Equal(uncompressed, uncompressedPayload) {
 				t.Fatalf("Unexpected uncomressed data: %q", uncompressed)
+			}
+		})
+	}
+}
+
+func TestWSCompressionSendBoundedByMaxMessageSize(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		browser bool
+	}{
+		{"single frame per message", false},
+		{"fragmented compressed frames", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := testWSOptions()
+			opts.MaxPending = MAX_PENDING_SIZE
+			s := &Server{opts: opts}
+			c := &client{srv: s, ws: &websocket{compress: true, browser: test.browser}}
+			c.initClient()
+			// Use a low max_payload so that the per-message transport limit
+			// (wsMaxMsgPayloadMultiple * max_payload) is easy to exceed.
+			const mpay = 1024
+			c.mpay = mpay
+			limit := int(wsMaxMessageSize(mpay))
+
+			// Random data does not compress, which also exercises the bound
+			// on the compressed payload, not just on the inflated one.
+			pending := make([]byte, 60000)
+			for i := 0; i < len(pending); i++ {
+				pending[i] = byte(rand.Intn(256))
+			}
+
+			// Queue as unevenly sized buffers, including one much bigger
+			// than the limit, so messages have to split within a buffer.
+			c.mu.Lock()
+			c.out.nb = net.Buffers{pending[:5], pending[5:30000], pending[30000:30007], pending[30007:]}
+			nb, _ := c.collapsePtoNB()
+			c.mu.Unlock()
+
+			var flat []byte
+			for _, b := range nb {
+				flat = append(flat, b...)
+			}
+
+			// Walk the WebSocket frames, grouping fragmented frames into
+			// messages, and verify that each message respects the limits
+			// that a receiving nats-server enforces before inflating.
+			var inflated, wire []byte
+			var msgs int
+			for pos := 0; pos < len(flat); {
+				b0, b1 := flat[pos], flat[pos+1]
+				final := b0&wsFinalBit != 0
+				if b1&wsMaskBit != 0 {
+					t.Fatalf("Unexpected mask bit set")
+				}
+				sz := int(b1 & 0x7F)
+				pos += 2
+				switch sz {
+				case 126:
+					sz = int(binary.BigEndian.Uint16(flat[pos:]))
+					pos += 2
+				case 127:
+					sz = int(binary.BigEndian.Uint64(flat[pos:]))
+					pos += 8
+				}
+				wire = append(wire, flat[pos:pos+sz]...)
+				pos += sz
+				if !final {
+					continue
+				}
+				msgs++
+				// The receiver buffers the compressed payload plus the last
+				// block before inflating, and that must fit in the limit.
+				if len(wire)+len(compressLastBlock) > limit {
+					t.Fatalf("Compressed message of size %v exceeds limit %v", len(wire), limit)
+				}
+				d := flate.NewReader(bytes.NewBuffer(append(wire, compressLastBlock...)))
+				ub, err := io.ReadAll(d)
+				if err != nil {
+					t.Fatalf("Error inflating message: %v", err)
+				}
+				if len(ub) > limit {
+					t.Fatalf("Message inflates to %v bytes, exceeds limit %v", len(ub), limit)
+				}
+				inflated = append(inflated, ub...)
+				wire = nil
+			}
+			if expected := (len(pending) + limit - 1) / limit; msgs < expected {
+				t.Fatalf("Expected pending data to be split into at least %v messages, got %v", expected, msgs)
+			}
+			if !bytes.Equal(inflated, pending) {
+				t.Fatalf("Inflated stream does not match queued data")
 			}
 		})
 	}

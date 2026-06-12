@@ -3061,6 +3061,60 @@ func TestLeafNodeWSBasic(t *testing.T) {
 	}
 }
 
+func TestLeafNodeWSCompressedBurstAboveMaxPayload(t *testing.T) {
+	// Use a low max_payload so that a burst of individually valid messages
+	// easily exceeds the websocket transport limit (8 * max_payload) that
+	// the receiving server enforces per compressed websocket message.
+	o := testDefaultLeafNodeWSOptions()
+	o.MaxPayload = 1024
+	o.Websocket.Compression = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	lo := testDefaultRemoteLeafNodeWSOptions(t, o, false)
+	lo.MaxPayload = 1024
+	lo.LeafNode.Remotes[0].Websocket.Compression = true
+	ln := RunServer(lo)
+	defer ln.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+	checkLeafNodeConnected(t, ln)
+
+	// Subscriber on the leaf, publisher on the hub: the hub compresses
+	// what it writes to its accepted websocket leafnode connection.
+	ncLeaf := natsConnect(t, ln.ClientURL())
+	defer ncLeaf.Close()
+	sub := natsSubSync(t, ncLeaf, "foo")
+	natsFlush(t, ncLeaf)
+	checkSubInterest(t, s, globalAccountName, "foo", time.Second)
+
+	ncHub := natsConnect(t, s.ClientURL())
+	defer ncHub.Close()
+
+	// Burst of messages, each within max_payload, that batch up in the
+	// hub's pending output for the leafnode connection. If the writer
+	// compresses them all into a single websocket message, the leaf
+	// rejects it with "maximum payload exceeded" and closes the
+	// connection, dropping the messages.
+	const total = 500
+	payload := make([]byte, 512)
+	for i := 0; i < len(payload); i++ {
+		payload[i] = byte('A' + i%26)
+	}
+	for i := 0; i < total; i++ {
+		natsPub(t, ncHub, "foo", payload)
+	}
+	natsFlush(t, ncHub)
+
+	for i := 0; i < total; i++ {
+		msg := natsNexMsg(t, sub, time.Second)
+		if !bytes.Equal(msg.Data, payload) {
+			t.Fatalf("Invalid message #%v: %q", i, msg.Data)
+		}
+	}
+	checkLeafNodeConnected(t, s)
+}
+
 func TestLeafNodeWSRemoteCompressAndMaskingOptions(t *testing.T) {
 	for _, test := range []struct {
 		name      string

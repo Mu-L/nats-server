@@ -196,6 +196,20 @@ func wsMaxMessageSize(mpay int) uint64 {
 	return limit
 }
 
+// Maximum amount of uncompressed pending data that the writer may batch
+// into a single compressed WebSocket message. A receiving nats-server
+// enforces wsMaxMessageSize() on both the compressed input and the inflated
+// output of a message, so headroom is reserved to keep the compressed
+// payload itself within the receiver's limit too. DEFLATE's worst-case
+// expansion of incompressible data is ~0.03% plus a few bytes (RFC 1951:
+// 5 bytes per 16KB stored block); ~1.6% plus 64 bytes is reserved here as
+// a comfortable margin over that.
+func wsMaxSendMessageSize(mpay int) int {
+	limit := int(wsMaxMessageSize(mpay))
+	headroom := limit/64 + 64
+	return max(limit-headroom, 1)
+}
+
 // Returns a slice containing `needed` bytes from the given buffer `buf`
 // starting at position `pos`, and possibly read from the given reader `r`.
 // When bytes are present in `buf`, the `pos` is incremented by the number
@@ -1508,70 +1522,91 @@ func (c *client) wsCollapsePtoNB() (net.Buffers, int64) {
 		if mfs > 0 && c.ws.nocompfrag {
 			mfs = 0
 		}
-		buf := bytes.NewBuffer(nbPoolGet(usz))
+		// Bound the amount of pending data compressed into a single WebSocket message.
+		maxUnc := wsMaxSendMessageSize(int(atomic.LoadInt32(&c.mpay)))
+		bsz := min(usz, maxUnc)
 		cp := c.ws.compressor
-		if cp == nil {
-			c.ws.compressor, _ = flate.NewWriter(buf, flate.BestSpeed)
-			cp = c.ws.compressor
-		} else {
-			cp.Reset(buf)
-		}
 		var csz int
-		for i, b := range nb {
-			for len(b) > 0 {
-				n, err := cp.Write(b)
-				if err != nil {
-					// Whatever this error is, it'll be handled by the cp.Flush()
-					// call below, as the same error will be returned there.
-					// Let the outer loop return all the buffers back to the pool
-					// and fall through naturally.
-					break
-				}
-				b = b[n:]
+		for i, off := 0, 0; i < len(nb); {
+			buf := bytes.NewBuffer(nbPoolGet(bsz))
+			if cp == nil {
+				c.ws.compressor, _ = flate.NewWriter(buf, flate.BestSpeed)
+				cp = c.ws.compressor
+			} else {
+				cp.Reset(buf)
 			}
-			// Use original slice since capacity will change to zero
-			// in the loop after consuming the buffer, which will make
-			// nbPoolPut discard it.
-			nbPoolPut(nb[i])
-		}
-		if err := cp.Flush(); err != nil {
-			c.Errorf("Error during compression: %v", err)
-			c.markConnAsClosed(WriteError)
-			cp.Reset(nil)
-			return nil, 0
-		}
-		b := buf.Bytes()
-		p := b[:len(b)-4]
-		if mfs > 0 && len(p) > mfs {
-			for first, final := true, false; len(p) > 0; first = false {
-				lp := len(p)
-				if lp > mfs {
-					lp = mfs
-				} else {
-					final = true
+			// Add pending buffers to this message up to the uncompressed limit.
+			for sz := 0; i < len(nb) && sz < maxUnc; {
+				b := nb[i][off:]
+				if len(b) > maxUnc-sz {
+					b = b[:maxUnc-sz]
 				}
-				// Only the first frame should be marked as compressed, so pass
-				// `first` for the compressed boolean.
-				fh := nbPoolGet(wsMaxFrameHeaderSize)[:wsMaxFrameHeaderSize]
-				n, key := wsFillFrameHeader(fh, mask, first, final, first, wsBinaryMessage, lp)
+				sz += len(b)
+				off += len(b)
+				for len(b) > 0 {
+					n, err := cp.Write(b)
+					if err != nil {
+						// Whatever this error is, it'll be handled by the cp.Flush()
+						// call below, as the same error will be returned there.
+						// Let the outer loop return all the buffers back to the pool
+						// and fall through naturally.
+						break
+					}
+					b = b[n:]
+				}
+				if off == len(nb[i]) {
+					// Use original slice since capacity will change to zero
+					// in the loop after consuming the buffer, which will make
+					// nbPoolPut discard it.
+					nbPoolPut(nb[i])
+					i, off = i+1, 0
+				}
+			}
+			if err := cp.Flush(); err != nil {
+				c.Errorf("Error during compression: %v", err)
+				c.markConnAsClosed(WriteError)
+				cp.Reset(nil)
+				// Return the buffers not yet consumed back to the pool. A
+				// partially consumed buffer is still returned whole since
+				// the compressed output it contributed to is discarded.
+				for ; i < len(nb); i++ {
+					nbPoolPut(nb[i])
+				}
+				return nil, 0
+			}
+			b := buf.Bytes()
+			p := b[:len(b)-4]
+			if mfs > 0 && len(p) > mfs {
+				for first, final := true, false; len(p) > 0; first = false {
+					lp := len(p)
+					if lp > mfs {
+						lp = mfs
+					} else {
+						final = true
+					}
+					// Only the first frame should be marked as compressed, so pass
+					// `first` for the compressed boolean.
+					fh := nbPoolGet(wsMaxFrameHeaderSize)[:wsMaxFrameHeaderSize]
+					n, key := wsFillFrameHeader(fh, mask, first, final, first, wsBinaryMessage, lp)
+					if mask {
+						wsMaskBuf(key, p[:lp])
+					}
+					bufs = append(bufs, fh[:n], append(nbPoolGet(lp), p[:lp]...))
+					csz += n + lp
+					p = p[lp:]
+				}
+				nbPoolPut(b)
+			} else {
+				ol := len(p)
+				h, key := wsCreateFrameHeader(mask, true, wsBinaryMessage, ol)
 				if mask {
-					wsMaskBuf(key, p[:lp])
+					wsMaskBuf(key, p)
 				}
-				bufs = append(bufs, fh[:n], append(nbPoolGet(lp), p[:lp]...))
-				csz += n + lp
-				p = p[lp:]
+				if ol > 0 {
+					bufs = append(bufs, h, p)
+				}
+				csz += len(h) + ol
 			}
-			nbPoolPut(b)
-		} else {
-			ol := len(p)
-			h, key := wsCreateFrameHeader(mask, true, wsBinaryMessage, ol)
-			if mask {
-				wsMaskBuf(key, p)
-			}
-			if ol > 0 {
-				bufs = append(bufs, h, p)
-			}
-			csz = len(h) + ol
 		}
 		// Make sure that the compressor no longer holds a reference to
 		// the bytes.Buffer, so that the underlying memory gets cleaned
