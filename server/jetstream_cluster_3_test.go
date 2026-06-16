@@ -10094,6 +10094,226 @@ func TestJetStreamDurableStreamMirrorRecreateAfterTeardown(t *testing.T) {
 	})
 }
 
+func TestJetStreamDurableStreamSourcePreExistingSub(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "O",
+		Subjects: []string{"foo"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+
+	_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver-subject",
+		AckPolicy:      AckFlowControl,
+		Heartbeat:      time.Second,
+	}, false)
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("1"))
+	require_NoError(t, err)
+
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name: "S",
+		Sources: []*StreamSource{{
+			Name:     "O",
+			Consumer: &StreamConsumerSource{Name: "C", DeliverSubject: "deliver-subject"},
+		}},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+
+	// Wait for the source to receive the first message.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 1 {
+			return fmt.Errorf("expected 1 msg, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+
+	mset, err := s.globalAccount().lookupStream("S")
+	require_NoError(t, err)
+
+	// Resolve the single source's index name.
+	var iname string
+	mset.mu.RLock()
+	for name := range mset.sources {
+		iname = name
+	}
+	mset.mu.RUnlock()
+	require_NotEqual(t, iname, _EMPTY_)
+
+	// Capture the durable subscription and its quit channel.
+	get := func() (*subscription, chan struct{}) {
+		mset.mu.RLock()
+		defer mset.mu.RUnlock()
+		si := mset.sources[iname]
+		require_NotNil(t, si)
+		return si.sub, si.qch
+	}
+	osub, oqch := get()
+	require_NotNil(t, osub)
+	require_NotNil(t, oqch)
+
+	// Force several soft resets. The durable subscription and shared goroutine
+	// must be reused (same pointers) and must not be torn down.
+	for range 5 {
+		mset.mu.Lock()
+		si := mset.sources[iname]
+		// Bypass the in-flight reset guard for a deterministic resend.
+		si.sip = false
+		mset.trySetupSourceConsumer(iname, si.sseq+1, time.Time{}, false)
+		mset.mu.Unlock()
+		nsub, nqch := get()
+		require_Equal(t, nsub, osub)
+		require_Equal(t, nqch, oqch)
+	}
+
+	// Messages keep flowing across resets, in order with no gaps.
+	for i := 2; i <= 20; i++ {
+		_, err = js.Publish("foo", []byte(fmt.Sprintf("%d", i)))
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 20 {
+			return fmt.Errorf("expected 20 msgs, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+	// Last sequence is present and the durable pipeline is still the same one we started with.
+	_, err = js.GetMsg("S", 20)
+	require_NoError(t, err)
+	fsub, fqch := get()
+	require_Equal(t, fsub, osub)
+	require_Equal(t, fqch, oqch)
+
+	// Soft resets that succeed must not accumulate failures.
+	mset.mu.RLock()
+	fails := mset.sources[iname].fails
+	mset.mu.RUnlock()
+	require_Equal(t, fails, 0)
+}
+
+func TestJetStreamDurableStreamSourceRecreateAfterTeardown(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "O",
+		Subjects: []string{"foo"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+
+	_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver-subject",
+		AckPolicy:      AckFlowControl,
+		Heartbeat:      time.Second,
+	}, false)
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("1"))
+	require_NoError(t, err)
+
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name: "S",
+		Sources: []*StreamSource{{
+			Name:     "O",
+			Consumer: &StreamConsumerSource{Name: "C", DeliverSubject: "deliver-subject"},
+		}},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 1 {
+			return fmt.Errorf("expected 1 msg, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+
+	mset, err := s.globalAccount().lookupStream("S")
+	require_NoError(t, err)
+
+	var iname string
+	mset.mu.RLock()
+	for name := range mset.sources {
+		iname = name
+	}
+	mset.mu.RUnlock()
+	require_NotEqual(t, iname, _EMPTY_)
+
+	getSub := func() *subscription {
+		mset.mu.RLock()
+		defer mset.mu.RUnlock()
+		si := mset.sources[iname]
+		require_NotNil(t, si)
+		return si.sub
+	}
+	sub0 := getSub()
+	require_NotNil(t, sub0)
+
+	// Simulate transport death: fully tear down the durable pipeline.
+	mset.mu.Lock()
+	si := mset.sources[iname]
+	mset.cancelSourceInfo(si)
+	subNil := si.sub == nil
+	sseq := si.sseq
+	// Allow the next setup to proceed immediately (bypass in-flight guard).
+	si.sip = false
+	mset.mu.Unlock()
+	require_True(t, subNil)
+
+	// A retry with no durable sub must rebuild a fresh one.
+	mset.mu.Lock()
+	mset.trySetupSourceConsumer(iname, sseq+1, time.Time{}, false)
+	mset.mu.Unlock()
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		if getSub() == nil {
+			return errors.New("durable sub not rebuilt yet")
+		}
+		return nil
+	})
+
+	// And the source resumes delivery.
+	for i := 2; i <= 10; i++ {
+		_, err = js.Publish("foo", []byte(fmt.Sprintf("%d", i)))
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 10 {
+			return fmt.Errorf("expected 10 msgs, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+}
+
 func TestJetStreamClusterDurableStreamSource(t *testing.T) {
 	test := func(t *testing.T, replicas int, retention RetentionPolicy) {
 		var s *Server

@@ -1721,7 +1721,7 @@ func TestJetStreamLeafNodeAndMirrorResyncAfterConnectionDown(t *testing.T) {
 			for iname, si := range mset.sources {
 				resetSourceInfo(si)
 				mset.cancelSourceInfo(si)
-				mset.setupSourceConsumer(iname, si.sseq+1, time.Time{})
+				mset.setupSourceConsumer(iname, si.sseq+1, time.Time{}, true)
 			}
 		}
 		mset.mu.Unlock()
