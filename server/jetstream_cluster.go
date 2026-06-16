@@ -3509,7 +3509,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 					s.Errorf("Error applying stream entries to '%s > %s': %v", accName, sa.Config.Name, err)
 					if isClusterResetErr(err) {
 						if mset.isMirror() && mset.IsLeader() {
-							mset.retryMirrorConsumer()
+							mset.retryMirrorConsumer(true)
 							continue
 						}
 						// If the error signals we timed out of a snapshot, we should try to replay the snapshot

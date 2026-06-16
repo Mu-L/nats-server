@@ -3135,7 +3135,7 @@ func (mset *stream) processMirrorMsgs(mirror *sourceInfo, ready *sync.WaitGroup)
 			}
 			// We are stalled.
 			if stalled {
-				mset.retryMirrorConsumer()
+				mset.retryMirrorConsumer(true)
 			}
 		}
 	}
@@ -3179,7 +3179,7 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 		} else {
 			// For idle heartbeats make sure we did not miss anything and check if we are considered stalled.
 			if ldseq := parseInt64(sliceHeader(JSLastConsumerSeq, m.hdr)); ldseq > 0 && uint64(ldseq) != mset.mirror.dseq {
-				needsRetry = true
+				needsRetry = !mset.mirror.sip
 			} else if fcReply := sliceHeader(JSConsumerStalled, m.hdr); len(fcReply) > 0 {
 				// Other side thinks we are stalled, so send flow control reply.
 				mset.outq.sendMsg(string(fcReply), nil)
@@ -3187,7 +3187,7 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 		}
 		mset.mu.Unlock()
 		if needsRetry {
-			mset.retryMirrorConsumer()
+			mset.retryMirrorConsumer(false)
 		}
 		return !needsRetry
 	}
@@ -3222,14 +3222,14 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 				mset.mirror.sseq = osseq
 				mset.mirror.dseq = odseq
 				mset.mu.Unlock()
-				mset.retryMirrorConsumer()
+				mset.retryMirrorConsumer(false)
 				return false
 			}
 			mset.mirror.dseq++
 			mset.mirror.sseq = sseq
 		} else {
 			mset.mu.Unlock()
-			mset.retryMirrorConsumer()
+			mset.retryMirrorConsumer(false)
 			return false
 		}
 	}
@@ -3304,7 +3304,7 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 				}
 			}
 			mset.mu.Unlock()
-			mset.retryMirrorConsumer()
+			mset.retryMirrorConsumer(false)
 		}
 	}
 	return err == nil
@@ -3332,11 +3332,16 @@ func (mset *stream) cancelMirrorConsumer() {
 // indicating that there is a retry.
 //
 // Lock is acquired in this function
-func (mset *stream) retryMirrorConsumer() error {
+func (mset *stream) retryMirrorConsumer(force bool) error {
 	mset.mu.Lock()
 	defer mset.mu.Unlock()
 	mset.srv.Debugf("Retrying mirror consumer for '%s > %s'", mset.acc.Name, mset.cfg.Name)
-	mset.cancelMirrorConsumer()
+	// For durable mirrors with a durable subscription, a retry is a "soft reset", unless forced.
+	mirror, cfg := mset.mirror, mset.cfg.Mirror
+	durableSub := mirror != nil && mirror.sub != nil && cfg != nil && cfg.Consumer != nil
+	if force || !durableSub {
+		mset.cancelMirrorConsumer()
+	}
 	return mset.setupMirrorConsumer()
 }
 
@@ -3426,6 +3431,52 @@ func (mset *stream) scheduleSetupMirrorConsumerRetry() {
 // How long we wait for a response from a consumer create request for a source or mirror.
 var srcConsumerWaitTime = 30 * time.Second
 
+// How long we wait for a response from a consumer reset request for a durable source or mirror.
+var srcDurableConsumerWaitTime = 5 * time.Second
+
+// createMirrorPipeline creates the subscription and its message queue for a mirror.
+// Lock should be held.
+func (mset *stream) createMirrorPipeline(mirror *sourceInfo, deliverSubject string) error {
+	qname := fmt.Sprintf("[ACC:%s] stream mirror '%s' of '%s' msgs", mset.acc.Name, mset.cfg.Name, mset.cfg.Mirror.Name)
+	// Create a new queue each time
+	mirror.msgs = newIPQueue[*inMsg](mset.srv, qname)
+	msgs := mirror.msgs
+	sub, err := mset.subscribeInternal(deliverSubject, func(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+		hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
+		if len(hdr) > 0 {
+			// Remove any Nats-Expected- headers as we don't want to validate them.
+			hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Expected-")
+			// Remove any Nats-Batch- headers, batching is not supported when mirroring.
+			hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Batch-")
+		}
+		mset.queueInbound(msgs, subject, reply, hdr, msg, nil, nil)
+		mirror.last.Store(time.Now().UnixNano())
+	})
+	if err != nil {
+		return err
+	}
+	// Save our sub.
+	mirror.sub = sub
+	return nil
+}
+
+// createMirrorRoutine creates the goroutine that processes mirror messages.
+// Lock should be held.
+func (mset *stream) createMirrorRoutine(mirror *sourceInfo, ready *sync.WaitGroup) {
+	if !mset.srv.startGoRoutine(
+		func() { mset.processMirrorMsgs(mirror, ready) },
+		pprofLabels{
+			"type":     "mirror",
+			"account":  mset.acc.Name,
+			"stream":   mset.cfg.Name,
+			"consumer": mirror.cname,
+		},
+	) {
+		mirror.wg.Done()
+		ready.Done()
+	}
+}
+
 // Setup our mirror consumer.
 // Lock should be held.
 func (mset *stream) setupMirrorConsumer() error {
@@ -3446,10 +3497,19 @@ func (mset *stream) setupMirrorConsumer() error {
 		return errors.New("invalid mirror configuration")
 	}
 
+	// Durable mirror consumers' subscription is created independently and kept alive
+	// across resets/retries.
+	durable := mset.cfg.Mirror.Consumer != nil
+	durableSub := durable && mset.mirror != nil && mset.mirror.sub != nil
+
 	// If this is the first time
 	if mset.mirror == nil {
 		mset.mirror = &sourceInfo{name: mset.cfg.Mirror.Name}
-	} else {
+	} else if mset.mirror.sip {
+		// If setup already in progress, nothing to do.
+		return nil
+	} else if !durableSub {
+		// Tear down a previous pipeline.
 		mset.cancelSourceInfo(mset.mirror)
 		mset.mirror.sseq = mset.lseq
 	}
@@ -3461,9 +3521,8 @@ func (mset *stream) setupMirrorConsumer() error {
 
 	mirror := mset.mirror
 
-	// We want to throttle here in terms of how fast we request new consumers,
-	// or if the previous is still in progress.
-	if last := time.Since(mirror.lreq); last < sourceConsumerRetryThreshold || mirror.sip {
+	// We want to throttle here in terms of how fast we request new consumers.
+	if last := time.Since(mirror.lreq); last < sourceConsumerRetryThreshold {
 		mset.scheduleSetupMirrorConsumerRetry()
 		return nil
 	}
@@ -3601,9 +3660,36 @@ func (mset *stream) setupMirrorConsumer() error {
 	subject := generateSubject()
 
 	// Reset
-	mirror.msgs = nil
 	mirror.err = nil
 	mirror.sip = true
+
+	if durable {
+		// Stand up the durable subscription and its processing goroutine up front.
+		if mirror.sub == nil {
+			if err = mset.createMirrorPipeline(mirror, durableDeliverSubject); err != nil {
+				mirror.err = NewJSMirrorConsumerSetupFailedError(err, Unless(err))
+				mirror.sip = false
+				mset.unsubscribe(crSub)
+				mset.scheduleSetupMirrorConsumerRetry()
+				return nil
+			}
+			// Baseline the stream sequence to our applied position; from here it is
+			// monotonic and owned by the per-message logic (never lowered on reset).
+			mirror.sseq = mset.lseq
+			mirror.qch = make(chan struct{})
+			mirror.wg.Add(1)
+			// Unlike the ephemeral path, we don't ready.Wait() below. The durable
+			// goroutine is started once and kept alive across resets. Waiting would
+			// also deadlock since we're holding the stream lock.
+			ready := &sync.WaitGroup{}
+			ready.Add(1)
+			mset.createMirrorRoutine(mirror, ready)
+		}
+		// Clear the delivery sequence, since we'll reset.
+		mirror.dseq = 0
+	} else {
+		mirror.msgs = nil
+	}
 
 	if durableDeliverSubject != _EMPTY_ {
 		// Send the consumer reset request
@@ -3619,6 +3705,12 @@ func (mset *stream) setupMirrorConsumer() error {
 	}
 
 	go func() {
+		// Use a longer timeout for ephemeral consumers, since they need to be created from scratch.
+		timeout := srcConsumerWaitTime
+		if durable {
+			// Use a shorter timeout for durable consumers, since they only need to be reset.
+			timeout = srcDurableConsumerWaitTime
+		}
 
 		var retry bool
 		defer func() {
@@ -3626,12 +3718,15 @@ func (mset *stream) setupMirrorConsumer() error {
 			// Check that this is still valid and if so, clear the "setup in progress" flag.
 			if mset.mirror != nil {
 				mset.mirror.sip = false
-				// If we need to retry, schedule now
+				// If we need to retry, schedule now.
 				// If sub is not nil means we re-established somewhere else so do not re-attempt here.
-				if retry && mset.mirror.sub == nil {
+				// Unless we're durable, in which case we always have the sub populated.
+				if retry && (durable || mset.mirror.sub == nil) {
 					mset.mirror.fails++
-					// Cancel here since we can not do anything with this consumer at this point.
-					mset.cancelSourceInfo(mset.mirror)
+					if !durable {
+						// Cancel here since we can not do anything with this consumer at this point.
+						mset.cancelSourceInfo(mset.mirror)
+					}
 					mset.scheduleSetupMirrorConsumerRetry()
 				} else {
 					// Clear on success.
@@ -3643,16 +3738,19 @@ func (mset *stream) setupMirrorConsumer() error {
 
 		// Wait for previous processMirrorMsgs go routine to be completely done.
 		// If none is running, this will not block.
-		mset.mu.Lock()
-		if mset.mirror == nil {
-			// Mirror config has been removed.
-			mset.unsubscribe(crSub)
+		// For durable mirrors the processing goroutine remains alive, so don't wait.
+		if !durable {
+			mset.mu.Lock()
+			if mset.mirror == nil {
+				// Mirror config has been removed.
+				mset.unsubscribe(crSub)
+				mset.mu.Unlock()
+				return
+			}
+			wg := &mset.mirror.wg
 			mset.mu.Unlock()
-			return
+			wg.Wait()
 		}
-		wg := &mset.mirror.wg
-		mset.mu.Unlock()
-		wg.Wait()
 
 	SELECT:
 		select {
@@ -3670,7 +3768,7 @@ func (mset *stream) setupMirrorConsumer() error {
 
 			if ccr.Error != nil || ccr.ConsumerInfo == nil {
 				// If the responding server doesn't support sourcing consumers, retry without it.
-				if req.Config.Sourcing && ccr.Error != nil &&
+				if !durable && req.Config.Sourcing && ccr.Error != nil &&
 					(ccr.Error.ErrCode == uint16(JSRequiredApiLevelErr) || ccr.Error.ErrCode == uint16(JSInvalidJSONErr)) {
 					// Unset for retry.
 					req.Config.Sourcing = false
@@ -3704,35 +3802,17 @@ func (mset *stream) setupMirrorConsumer() error {
 			// We can now unsubscribe.
 			mset.unsubscribe(crSub)
 
-			// Setup actual subscription to process messages from our source.
-			qname := fmt.Sprintf("[ACC:%s] stream mirror '%s' of '%s' msgs", mset.acc.Name, mset.cfg.Name, mset.cfg.Mirror.Name)
-			// Create a new queue each time
-			mirror.msgs = newIPQueue[*inMsg](mset.srv, qname)
-			msgs := mirror.msgs
-			if durableDeliverSubject != _EMPTY_ {
-				deliverSubject = durableDeliverSubject
-			} else {
+			// For ephemeral mirrors, set up the subscription now that we know the
+			// deliver subject from the response.
+			if !durable {
 				deliverSubject = ccr.ConsumerInfo.Config.DeliverSubject
-			}
-			sub, err := mset.subscribeInternal(deliverSubject, func(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
-				hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
-				if len(hdr) > 0 {
-					// Remove any Nats-Expected- headers as we don't want to validate them.
-					hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Expected-")
-					// Remove any Nats-Batch- headers, batching is not supported when mirroring.
-					hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Batch-")
+				if err = mset.createMirrorPipeline(mirror, deliverSubject); err != nil {
+					mirror.err = NewJSMirrorConsumerSetupFailedError(err, Unless(err))
+					retry = true
+					mset.mu.Unlock()
+					return
 				}
-				mset.queueInbound(msgs, subject, reply, hdr, msg, nil, nil)
-				mirror.last.Store(time.Now().UnixNano())
-			})
-			if err != nil {
-				mirror.err = NewJSMirrorConsumerSetupFailedError(err, Unless(err))
-				retry = true
-				mset.mu.Unlock()
-				return
 			}
-			// Save our sub.
-			mirror.sub = sub
 
 			// Check if we need to skip messages.
 			// Re-capture state since the previous may be stale.
@@ -3761,30 +3841,25 @@ func (mset *stream) setupMirrorConsumer() error {
 				}
 			}
 
-			// Capture consumer name.
-			mirror.cname = ccr.ConsumerInfo.Name
-			mirror.dseq = 0
-			mirror.sseq = max(ccr.ConsumerInfo.Delivered.Stream, state.LastSeq)
-			mirror.qch = make(chan struct{})
-			mirror.wg.Add(1)
-			ready.Add(1)
-			if !mset.srv.startGoRoutine(
-				func() { mset.processMirrorMsgs(mirror, &ready) },
-				pprofLabels{
-					"type":     "mirror",
-					"account":  mset.acc.Name,
-					"stream":   mset.cfg.Name,
-					"consumer": mirror.cname,
-				},
-			) {
-				mirror.wg.Done()
-				ready.Done()
+			if durable {
+				// The subscription and goroutine already exist, only raise the stream sequence.
+				mirror.sseq = max(mirror.sseq, ccr.ConsumerInfo.Delivered.Stream)
+				mset.mu.Unlock()
+			} else {
+				// Capture consumer name.
+				mirror.cname = ccr.ConsumerInfo.Name
+				mirror.dseq = 0
+				mirror.sseq = max(ccr.ConsumerInfo.Delivered.Stream, state.LastSeq)
+				mirror.qch = make(chan struct{})
+				mirror.wg.Add(1)
+				ready.Add(1)
+				mset.createMirrorRoutine(mirror, &ready)
+				mset.mu.Unlock()
+				ready.Wait()
 			}
-			mset.mu.Unlock()
-			ready.Wait()
-		case <-time.After(srcConsumerWaitTime):
+		case <-time.After(timeout):
 			mset.unsubscribe(crSub)
-			// We already waited 30 seconds, let's retry now.
+			// We already waited long enough, let's retry now.
 			retry = true
 		}
 	}()
