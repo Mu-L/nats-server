@@ -14,7 +14,6 @@
 package server
 
 import (
-	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -38,15 +37,11 @@ func newDiskIOSemaphore(n int) *diskIOSemaphore {
 }
 
 func defaultDiskIOSemaphore() *diskIOSemaphore {
-	// Limit ourselves to a sensible number of blocking I/O calls.
-	// Range between 4-16 concurrent disk I/Os based on CPU cores,
-	// or 50% of cores if greater than 32 cores.
-	mp := runtime.GOMAXPROCS(-1)
-	nIO := min(16, max(4, mp))
-	if mp > 32 {
-		nIO = max(16, mp/2)
-	}
-	return newDiskIOSemaphore(nIO)
+	// The disk IO semaphore used to be sized based on the number
+	// of CPU cores. That policy led to poor use of devices that
+	// can handle many requests in parallel, so simply cap the
+	// number of concurrent IO requests handed to the Go runtime.
+	return newDiskIOSemaphore(512)
 }
 
 func (d *diskIOSemaphore) acquire() {
