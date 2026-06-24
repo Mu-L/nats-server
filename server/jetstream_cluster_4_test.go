@@ -6397,6 +6397,148 @@ func TestJetStreamClusterMaxHAAssetsRebuildAfterLeaderChange(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterMaxHAAssetsScaleUpConsumerRideAlong(t *testing.T) {
+	const maxAssets = 2
+	tmpl := strings.Replace(jsClusterTempl, "store_dir:", fmt.Sprintf("limits: {max_ha_assets: %d}, store_dir:", maxAssets), 1)
+	c := createJetStreamClusterWithTemplateAndModHook(t, tmpl, "R3S", 3, nil)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Snapshot of the meta leader's authoritative per-peer HA asset counts.
+	peerHAAssets := func() map[string]int {
+		sjs := c.leader().getJetStream()
+		sjs.mu.RLock()
+		defer sjs.mu.RUnlock()
+		m := make(map[string]int, len(sjs.cluster.peerHAAssets))
+		for k, v := range sjs.cluster.peerHAAssets {
+			m[k] = v
+		}
+		return m
+	}
+
+	// An R1 stream with two durable consumers. Nothing is HA yet, so the meta
+	// leader tracks no HA assets.
+	cfg := &nats.StreamConfig{Name: "S", Subjects: []string{"s"}, Replicas: 1}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+	for _, d := range []string{"C1", "C2"} {
+		_, err = js.AddConsumer("S", &nats.ConsumerConfig{Durable: d, AckPolicy: nats.AckExplicitPolicy})
+		require_NoError(t, err)
+	}
+	require_Len(t, len(peerHAAssets()), 0)
+
+	// Scaling to R3 would place the stream plus both consumers (3 HA assets) on
+	// every peer, exceeding max_ha_assets=2. The update must be rejected up-front
+	// (insufficient resources, not "no suitable peers") and leave no accounting.
+	cfg.Replicas = 3
+	_, err = js.UpdateStream(cfg)
+	require_Error(t, err)
+	require_True(t, strings.Contains(err.Error(), "insufficient resources"))
+	require_Len(t, len(peerHAAssets()), 0)
+
+	// Dropping one consumer brings the post-scale footprint to exactly the limit
+	// (stream + one consumer = 2 per peer), so the same scale-up now succeeds.
+	require_NoError(t, js.DeleteConsumer("S", "C2"))
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+	ha := peerHAAssets()
+	require_Len(t, len(ha), 3)
+	for _, n := range ha {
+		require_Equal(t, n, 2)
+	}
+}
+
+func TestJetStreamClusterMaxHAAssetsProcessAddPeerIgnoresLimit(t *testing.T) {
+	c := createJetStreamClusterWithTemplate(t, jsClusterTempl, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// R3 stream with two durable consumers: 3 HA assets on each of the 3 peers.
+	_, err := js.AddStream(&nats.StreamConfig{Name: "S", Subjects: []string{"s"}, Replicas: 3})
+	require_NoError(t, err)
+	for _, d := range []string{"C1", "C2"} {
+		_, err = js.AddConsumer("S", &nats.ConsumerConfig{Durable: d, AckPolicy: nats.AckExplicitPolicy})
+		require_NoError(t, err)
+	}
+	nc.Close()
+
+	// Lower max_ha_assets to 2 on disk and restart, so each existing peer already
+	// holds more HA assets (3) than the new limit allows.
+	c.stopAll()
+	for _, o := range c.opts {
+		b, err := os.ReadFile(o.ConfigFile)
+		require_NoError(t, err)
+		newCfg := strings.Replace(string(b), "store_dir:", "limits: {max_ha_assets: 2}, store_dir:", 1)
+		require_True(t, strings.Contains(newCfg, "max_ha_assets: 2"))
+		require_NoError(t, os.WriteFile(o.ConfigFile, []byte(newCfg), defaultFilePerms))
+	}
+	c.restartAll()
+	c.waitOnClusterReady()
+	c.waitOnStreamLeader(globalAccountName, "S")
+
+	// Pick a stream replica that is neither the stream nor meta leader, then remove
+	// it so S becomes under-replicated (R2) with no spare peer to refill it.
+	nc, js = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+	si, err := js.StreamInfo("S")
+	require_NoError(t, err)
+	require_True(t, si.Cluster != nil && len(si.Cluster.Replicas) >= 1)
+
+	ml := c.leader()
+	var toRemove string
+	for _, r := range si.Cluster.Replicas {
+		if r.Name != si.Cluster.Leader && r.Name != ml.Name() {
+			toRemove = r.Name
+			break
+		}
+	}
+	require_NotEqual(t, toRemove, _EMPTY_)
+
+	snc, err := nats.Connect(ml.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer snc.Close()
+	jsreq, err := json.Marshal(&JSApiMetaServerRemoveRequest{Server: toRemove})
+	require_NoError(t, err)
+	rmsg, err := snc.Request(JSApiRemoveServer, jsreq, 5*time.Second)
+	require_NoError(t, err)
+	var rresp JSApiMetaServerRemoveResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &rresp))
+	require_True(t, rresp.Error == nil)
+	c.waitOnPeerCount(2)
+
+	// Add a fresh server. processAddPeer is a system-level command that intentionally
+	// ignores max_ha_assets, so it refills the under-replicated stream onto the new peer
+	// even though S plus its two consumers (3 HA assets) exceed the max_ha_assets=2 limit.
+	rs := c.addInNewServer()
+	c.waitOnServerCurrent(rs)
+	c.waitOnPeerCount(3)
+
+	// S must be brought back up to R3 onto the new peer despite the limit.
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return err
+		}
+		if replicas := len(si.Cluster.Replicas) + 1; replicas != 3 {
+			return fmt.Errorf("expected S to be refilled to R3, got R%d", replicas)
+		}
+		for _, r := range si.Cluster.Replicas {
+			if r.Name == rs.Name() {
+				return nil
+			}
+		}
+		if si.Cluster.Leader == rs.Name() {
+			return nil
+		}
+		return fmt.Errorf("expected new peer %s to be added to S, got leader %q replicas %v",
+			rs.Name(), si.Cluster.Leader, si.Cluster.Replicas)
+	})
+}
+
 func TestJetStreamClusterTrackInflightHAAssetAccounting(t *testing.T) {
 	const n1, n2, n3, n4 = "n1", "n2", "n3", "n4"
 

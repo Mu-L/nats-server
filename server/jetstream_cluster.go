@@ -1507,6 +1507,45 @@ func (cc *jetStreamCluster) rebuildPeerAssets() {
 	}
 }
 
+// updateExceedsMaxHAAssets reports whether replacing the stream and consumers
+// old assignments with the new assignments would exceed the max_ha_assets.
+// Lock must be held.
+func (js *jetStream) updateExceedsMaxHAAssets(accName string, osa, sa *streamAssignment, consumers []*consumerAssignment) bool {
+	cc := js.cluster
+	maxHaAssets := js.srv.getOpts().JetStreamLimits.MaxHAAssets
+	if maxHaAssets <= 0 || cc == nil {
+		return false
+	}
+
+	delta := make(map[string]int)
+	add := func(replicas int, peers []string, sign int) {
+		if replicas > 1 {
+			for _, peer := range peers {
+				delta[peer] += sign
+			}
+		}
+	}
+	if osa != nil {
+		add(osa.Config.Replicas, osa.Group.Peers, -1)
+	}
+	add(sa.Config.Replicas, sa.Group.Peers, +1)
+	for _, cca := range consumers {
+		if osa != nil {
+			if oca := js.consumerAssignmentOrInflight(accName, osa.Config.Name, cca.Name); oca != nil {
+				add(oca.Config.replicas(osa.Config), oca.Group.Peers, -1)
+			}
+		}
+		add(cca.Config.replicas(sa.Config), cca.Group.Peers, +1)
+	}
+
+	for peer, d := range delta {
+		if d > 0 && cc.peerHAAssets[peer]+d > maxHaAssets {
+			return true
+		}
+	}
+	return false
+}
+
 // Return the cluster quit chan.
 func (js *jetStream) clusterQuitC() chan struct{} {
 	js.mu.RLock()
@@ -2636,6 +2675,8 @@ func (js *jetStream) processAddPeer(peer string) {
 			csa := sa.copyGroup()
 			csa.Group.Peers = append(csa.Group.Peers, peer)
 			// Send our proposal for this csa. Also use same group definition for all the consumers as well.
+			// We intentionally ignore max_ha_assets since this is a system-level command, and we'd rather
+			// have the streams and consumers be fully operational as soon as possible.
 			if err := cc.meta.Propose(encodeAddStreamAssignment(csa)); err != nil {
 				return
 			}
@@ -2735,6 +2776,8 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	}
 
 	// Send our proposal for this csa. Also use same group definition for all the consumers as well.
+	// We intentionally ignore max_ha_assets since this is a system-level command, and we'd rather
+	// have the streams and consumers be fully operational as soon as possible.
 	if err := cc.meta.Propose(encodeAddStreamAssignment(csa)); err != nil {
 		return false
 	}
@@ -8855,6 +8898,14 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		syncSubject = syncSubjForStream()
 	}
 	sa := &streamAssignment{Group: rg, Sync: syncSubject, Created: osa.Created, Config: newCfg, Subject: subject, Reply: reply, Client: ci}
+
+	// Confirm we'll still satisfy max_ha_assets after the update.
+	if js.updateExceedsMaxHAAssets(acc.Name, osa, sa, consumers) {
+		resp.Error = NewJSInsufficientResourcesError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
+	}
+
 	if err := meta.Propose(encodeUpdateStreamAssignment(sa)); err != nil {
 		return
 	}
@@ -9946,6 +9997,13 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 			nca.Group.Peers = newPeerSet
 			nca.Group.Preferred = curLeader
 			nca.Group.ScaleUp = true
+
+			// Confirm we'll still satisfy max_ha_assets after the update.
+			if js.updateExceedsMaxHAAssets(acc.Name, sa, sa, []*consumerAssignment{nca}) {
+				resp.Error = NewJSInsufficientResourcesError()
+				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+				return
+			}
 		} else if rBefore > rAfter {
 			// Mark the current leader as preferred, it will be kept in the new peer set.
 			nca.Group.Preferred = curLeader
