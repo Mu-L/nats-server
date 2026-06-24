@@ -2728,7 +2728,7 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	if cc == nil || cc.meta == nil {
 		return false
 	}
-	replaced := cc.remapStreamAssignment(csa, peer)
+	replaced := js.remapStreamAssignment(csa, peer)
 	accName := sa.Client.serviceAccount()
 	if !replaced {
 		s.Warnf("JetStream cluster could not replace peer for stream '%s > %s'", accName, sa.Config.Name)
@@ -7788,7 +7788,7 @@ func (js *jetStream) processLeaderChange(isLeader bool) {
 }
 
 // Lock should be held.
-func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePeer string) bool {
+func (js *jetStream) remapStreamAssignment(sa *streamAssignment, removePeer string) bool {
 	// Invoke placement algo passing RG peers that stay (existing) and the peer that is being removed (ignore)
 	var retain, ignore []string
 	for _, v := range sa.Group.Peers {
@@ -7799,7 +7799,7 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePe
 		}
 	}
 
-	newPeers, placementError := cc.selectPeerGroup(len(sa.Group.Peers), sa.Group.Cluster, sa.Config, retain, 0, ignore)
+	newPeers, placementError := js.selectPeerGroup(len(sa.Group.Peers), sa.Group.Cluster, sa.Config, retain, 0, ignore)
 
 	if placementError == nil {
 		sa.Group.Peers = newPeers
@@ -7923,8 +7923,9 @@ func (e *selectPeerError) accumulate(eAdd *selectPeerError) {
 // selectPeerGroup will select a group of peers to start a raft group.
 // when peers exist already the unique tag prefix check for the replaceFirstExisting will be skipped
 // js lock should be held.
-func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamConfig, existing []string, replaceFirstExisting int, ignore []string) ([]string, *selectPeerError) {
-	if cluster == _EMPTY_ || cfg == nil {
+func (js *jetStream) selectPeerGroup(r int, cluster string, cfg *StreamConfig, existing []string, replaceFirstExisting int, ignore []string) ([]string, *selectPeerError) {
+	cc := js.cluster
+	if cluster == _EMPTY_ || cfg == nil || cc == nil {
 		return nil, &selectPeerError{misc: true}
 	}
 
@@ -8022,14 +8023,9 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 
 	// Grab the number of streams currently assigned to each peer.
 	peerStreams := make(map[string]int, len(peers))
-	for _, asa := range cc.streams {
-		for _, sa := range asa {
-			if sa.unsupported != nil {
-				continue
-			}
-			for _, peer := range sa.Group.Peers {
-				peerStreams[peer]++
-			}
+	for _, sa := range js.streamAssignmentsOrInflightSeqAllAccounts() {
+		for _, peer := range sa.Group.Peers {
+			peerStreams[peer]++
 		}
 	}
 
@@ -8258,7 +8254,7 @@ func (js *jetStream) createGroupForStream(ci *ClientInfo, cfg *StreamConfig) (*r
 	}
 
 	// Default connected cluster from the request origin.
-	cc, cluster := js.cluster, ci.Cluster
+	cluster := ci.Cluster
 	// If specified, override the default.
 	clusterDefined := cfg.Placement != nil && cfg.Placement.Cluster != _EMPTY_
 	if clusterDefined {
@@ -8272,7 +8268,7 @@ func (js *jetStream) createGroupForStream(ci *ClientInfo, cfg *StreamConfig) (*r
 	// Need to create a group here.
 	errs := &selectPeerError{}
 	for _, cn := range clusters {
-		peers, err := cc.selectPeerGroup(replicas, cn, cfg, nil, 0, nil)
+		peers, err := js.selectPeerGroup(replicas, cn, cfg, nil, 0, nil)
 		if len(peers) < replicas {
 			errs.accumulate(err)
 			continue
@@ -8656,7 +8652,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 					rg.Cluster = ci.Cluster
 				}
 			}
-			peers, err := cc.selectPeerGroup(newCfg.Replicas, rg.Cluster, newCfg, rg.Peers, 0, nil)
+			peers, err := js.selectPeerGroup(newCfg.Replicas, rg.Cluster, newCfg, rg.Peers, 0, nil)
 			if err != nil {
 				resp.Error = NewJSClusterNoPeersError(err)
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
