@@ -4246,6 +4246,177 @@ func TestJetStreamClusterConsumerScaleUp(t *testing.T) {
 	c.waitOnConsumerLeader("$G", "TEST", "DUR")
 }
 
+func TestJetStreamClusterConsumerAutoScaleWithStream(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		cfg       *nats.ConsumerConfig
+		autoScale bool // when the consumer is expected to follow the stream's replica count
+	}{
+		{
+			name: "EphemeralAutoName",
+			cfg: &nats.ConsumerConfig{
+				AckPolicy:         nats.AckExplicitPolicy,
+				InactiveThreshold: time.Minute,
+			},
+			autoScale: false,
+		},
+		{
+			name: "EphemeralProvidedName",
+			cfg: &nats.ConsumerConfig{
+				Name:              "EPH",
+				AckPolicy:         nats.AckExplicitPolicy,
+				InactiveThreshold: time.Minute,
+			},
+			autoScale: false,
+		},
+		{
+			name: "Durable",
+			cfg: &nats.ConsumerConfig{
+				Durable:   "DUR",
+				AckPolicy: nats.AckExplicitPolicy,
+			},
+			autoScale: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			// Start the stream out at R1.
+			cfg := &nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"foo"},
+				Replicas: 1,
+			}
+			_, err := js.AddStream(cfg)
+			require_NoError(t, err)
+
+			ci, err := js.AddConsumer("TEST", test.cfg)
+			require_NoError(t, err)
+			cname := ci.Name
+			require_NotEqual(t, cname, _EMPTY_)
+
+			observedReplicas := func() (int, error) {
+				ci, err := js.ConsumerInfo("TEST", cname)
+				if err != nil {
+					return 0, err
+				}
+				if ci.Cluster == nil || ci.Cluster.Leader == _EMPTY_ {
+					return 0, fmt.Errorf("no consumer leader yet")
+				}
+				return len(ci.Cluster.Replicas) + 1, nil
+			}
+
+			scaleAndCheck := func(replicas int) {
+				t.Helper()
+				cfg.Replicas = replicas
+				_, err := js.UpdateStream(cfg)
+				require_NoError(t, err)
+
+				wantR := 1
+				if test.autoScale {
+					wantR = replicas
+				}
+
+				// Ephemeral consumers must never follow the stream's replica count, not even transiently.
+				if !test.autoScale {
+					until := time.Now().Add(500 * time.Millisecond)
+					for time.Now().Before(until) {
+						if gotR, err := observedReplicas(); err == nil && gotR > 1 {
+							t.Fatalf("stream R%d: %s consumer %q scaled to R%d, expected to stay R1",
+								replicas, test.name, cname, gotR)
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+				}
+
+				// Every consumer must converge to and hold the expected replica count.
+				c.waitOnStreamLeader(globalAccountName, "TEST")
+				checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+					gotR, err := observedReplicas()
+					if err != nil {
+						return err
+					}
+					if gotR != wantR {
+						return fmt.Errorf("stream R%d: expected consumer R%d, got R%d", replicas, wantR, gotR)
+					}
+					return nil
+				})
+				c.waitOnConsumerLeader(globalAccountName, "TEST", cname)
+			}
+
+			// Scale up and back down.
+			for _, streamR := range []int{1, 2, 3, 2, 1} {
+				scaleAndCheck(streamR)
+			}
+		})
+	}
+}
+
+func TestJetStreamClusterConsumerNoAutoScaleOnRetentionChange(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Interest retention stream at R3. Under interest policy consumers keep peer
+	// parity with the stream, so the legacy ephemeral starts out at R3.
+	cfg := &nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.InterestPolicy,
+		Replicas:  3,
+	}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	// Legacy ephemeral, presents as R=0.
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: time.Minute,
+	})
+	require_NoError(t, err)
+	cname := ci.Name
+	require_NotEqual(t, cname, _EMPTY_)
+
+	observedReplicas := func() (int, error) {
+		ci, err := js.ConsumerInfo("TEST", cname)
+		if err != nil {
+			return 0, err
+		}
+		if ci.Cluster == nil || ci.Cluster.Leader == _EMPTY_ {
+			return 0, fmt.Errorf("no consumer leader yet")
+		}
+		return len(ci.Cluster.Replicas) + 1, nil
+	}
+	// Confirm the consumer follows the interest stream up to R3 to begin with.
+	gotR, err := observedReplicas()
+	require_NoError(t, err)
+	require_Equal(t, gotR, 3)
+
+	// Switch to limits retention while also scaling the stream up to R5.
+	// The ephemeral must not be auto scaled to follow the stream's replica count,
+	// not even transiently. Switching the retention policy is not an auto scale event.
+	cfg.Retention = nats.LimitsPolicy
+	cfg.Replicas = 5
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	until := time.Now().Add(2 * time.Second)
+	for time.Now().Before(until) {
+		time.Sleep(100 * time.Millisecond)
+		if gotR, err := observedReplicas(); err == nil && gotR > 3 {
+			t.Fatalf("ephemeral consumer %q scaled to R%d, expected to never follow the stream up to R5",
+				cname, gotR)
+		}
+	}
+}
+
 func TestJetStreamClusterPeerOffline(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R5S", 5)
 	defer c.shutdown()

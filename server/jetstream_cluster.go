@@ -8616,10 +8616,11 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 		// Need to remap any consumers.
 		for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, osa.Config.Name) {
-			// Legacy ephemerals are R=1 but present as R=0, so only auto-remap named consumers, or if we are downsizing the consumer peers.
+			// Legacy ephemerals are R=1 but present as R=0, so only auto-remap durable consumers, or if we are downsizing the consumer peers.
 			// If stream is interest or workqueue policy always remaps since they require peer parity with stream.
 			numPeers := len(ca.Group.Peers)
-			isAutoScale := ca.Config.Replicas == 0 && (ca.Config.Durable != _EMPTY_ || ca.Config.Name != _EMPTY_)
+			newReplicas := ca.Config.replicas(newCfg)
+			isAutoScale := newReplicas != ca.Config.replicas(osa.Config) && newReplicas == len(rg.Peers)
 			if isAutoScale || numPeers > len(rg.Peers) || newCfg.Retention != LimitsPolicy {
 				cca := ca.copyGroup()
 				// Adjust preferred as needed.
