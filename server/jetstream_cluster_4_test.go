@@ -6685,6 +6685,29 @@ func TestJetStreamClusterTrackInflightHAAssetAccounting(t *testing.T) {
 			want: map[string]int{n1: 1, n2: 1, n4: 1}, // n3 dropped, n4 added
 		},
 		{
+			name: "R3 stream move",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				str("S", 3, n1, n2, n3, n4),
+			},
+			want: map[string]int{n2: 1, n3: 1, n4: 1}, // Only the final peers are counted.
+		},
+		{
+			name: "R3 consumer move",
+			ops: []op{
+				str("S", 3, n1, n2, n3, n4),
+				con("S", "C", 0, n1, n2, n3, n4),
+			},
+			want: map[string]int{n2: 2, n3: 2, n4: 2}, // Only the final peers are counted.
+		},
+		{
+			name: "R3 stream under-replicated",
+			ops: []op{
+				str("S", 3, n1, n2),
+			},
+			want: map[string]int{n1: 1, n2: 1},
+		},
+		{
 			name: "R3 consumer peer replacement",
 			ops: []op{
 				str("S", 4, n1, n2, n3, n4),
@@ -6745,6 +6768,36 @@ func TestJetStreamClusterTrackInflightHAAssetAccounting(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJetStreamClusterGenPeerInfoSplitClamp(t *testing.T) {
+	peers := []string{"a", "b", "c"}
+
+	// In-range split behaves normally: leading=old, trailing=new.
+	newPeers, oldPeers, newSet, oldSet := genPeerInfo(peers, 1)
+	require_Len(t, len(oldPeers), 1)
+	require_Len(t, len(newPeers), 2)
+	require_True(t, oldSet["a"] && newSet["b"] && newSet["c"])
+
+	// Negative split (under-replicated / not-yet-expanded group): clamped to 0,
+	// so there are no old peers and every peer is new.
+	newPeers, oldPeers, newSet, oldSet = genPeerInfo(peers, -2)
+	require_Len(t, len(oldPeers), 0)
+	require_Len(t, len(newPeers), 3)
+	require_Len(t, len(oldSet), 0)
+	require_Len(t, len(newSet), 3)
+
+	// Split beyond len: clamped to len, so every peer is old and none are new.
+	newPeers, oldPeers, newSet, oldSet = genPeerInfo(peers, 5)
+	require_Len(t, len(oldPeers), 3)
+	require_Len(t, len(newPeers), 0)
+	require_Len(t, len(oldSet), 3)
+	require_Len(t, len(newSet), 0)
+
+	// Empty peers with a negative split must not panic.
+	newPeers, oldPeers, _, _ = genPeerInfo(nil, -1)
+	require_Len(t, len(oldPeers), 0)
+	require_Len(t, len(newPeers), 0)
 }
 
 func TestJetStreamClusterTrackInflightAssignmentVisibility(t *testing.T) {

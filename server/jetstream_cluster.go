@@ -1322,6 +1322,15 @@ func (cc *jetStreamCluster) isConsumerLeader(account, stream, consumer string) b
 	return false
 }
 
+// haAssetPeers the last replicas peers, similar to genPeerInfo to take
+// stream/consumer moves into account.
+func haAssetPeers(peers []string, replicas int) []string {
+	if replicas > 1 && len(peers) > replicas {
+		return peers[len(peers)-replicas:]
+	}
+	return peers
+}
+
 // Track the stream for the account `accName` in the inflight proposals map.
 // This is done after proposing a stream change.
 // (Write) Lock held on entry.
@@ -1331,7 +1340,7 @@ func (js *jetStream) trackInflightStreamProposal(accName string, sa *streamAssig
 	// Perform max HA asset accounting.
 	if osa != nil {
 		if osa.Config.Replicas > 1 {
-			for _, peer := range osa.Group.Peers {
+			for _, peer := range haAssetPeers(osa.Group.Peers, osa.Config.Replicas) {
 				cc.peerHAAssets[peer]--
 				if cc.peerHAAssets[peer] <= 0 {
 					delete(cc.peerHAAssets, peer)
@@ -1349,7 +1358,7 @@ func (js *jetStream) trackInflightStreamProposal(accName string, sa *streamAssig
 					continue
 				}
 				if oldReplicas > 1 {
-					for _, peer := range oca.Group.Peers {
+					for _, peer := range haAssetPeers(oca.Group.Peers, oldReplicas) {
 						cc.peerHAAssets[peer]--
 						if cc.peerHAAssets[peer] <= 0 {
 							delete(cc.peerHAAssets, peer)
@@ -1361,7 +1370,7 @@ func (js *jetStream) trackInflightStreamProposal(accName string, sa *streamAssig
 				// but when the consumer makes the accounting changes, it only knows the new stream.
 				// So we must adjust the accounting here while we know both the old and new stream.
 				if !deleted && newReplicas > 1 {
-					for _, peer := range oca.Group.Peers {
+					for _, peer := range haAssetPeers(oca.Group.Peers, newReplicas) {
 						cc.peerHAAssets[peer]++
 					}
 				}
@@ -1369,7 +1378,7 @@ func (js *jetStream) trackInflightStreamProposal(accName string, sa *streamAssig
 		}
 	}
 	if !deleted && sa.Config.Replicas > 1 {
-		for _, peer := range sa.Group.Peers {
+		for _, peer := range haAssetPeers(sa.Group.Peers, sa.Config.Replicas) {
 			cc.peerHAAssets[peer]++
 		}
 	}
@@ -1423,16 +1432,18 @@ func (js *jetStream) trackInflightConsumerProposal(accName, streamName string, c
 	}
 
 	// Perform max HA asset accounting.
-	if oca != nil && oca.Config.replicas(osa.Config) > 1 {
-		for _, peer := range oca.Group.Peers {
-			cc.peerHAAssets[peer]--
-			if cc.peerHAAssets[peer] <= 0 {
-				delete(cc.peerHAAssets, peer)
+	if oca != nil {
+		if r := oca.Config.replicas(osa.Config); r > 1 {
+			for _, peer := range haAssetPeers(oca.Group.Peers, r) {
+				cc.peerHAAssets[peer]--
+				if cc.peerHAAssets[peer] <= 0 {
+					delete(cc.peerHAAssets, peer)
+				}
 			}
 		}
 	}
-	if !deleted && ca.Config.replicas(osa.Config) > 1 {
-		for _, peer := range ca.Group.Peers {
+	if r := ca.Config.replicas(osa.Config); !deleted && r > 1 {
+		for _, peer := range haAssetPeers(ca.Group.Peers, r) {
 			cc.peerHAAssets[peer]++
 		}
 	}
@@ -1492,13 +1503,13 @@ func (cc *jetStreamCluster) rebuildPeerAssets() {
 	for _, asa := range cc.streams {
 		for _, sa := range asa {
 			if sa.Config.Replicas > 1 {
-				for _, peer := range sa.Group.Peers {
+				for _, peer := range haAssetPeers(sa.Group.Peers, sa.Config.Replicas) {
 					cc.peerHAAssets[peer]++
 				}
 			}
 			for _, ca := range sa.consumers {
 				if r := ca.Config.replicas(sa.Config); r > 1 {
-					for _, peer := range ca.Group.Peers {
+					for _, peer := range haAssetPeers(ca.Group.Peers, r) {
 						cc.peerHAAssets[peer]++
 					}
 				}
@@ -3222,6 +3233,11 @@ func (mset *stream) removeNode() {
 // Helper function to generate peer info.
 // lists and sets for old and new.
 func genPeerInfo(peers []string, split int) (newPeers, oldPeers []string, newPeerSet, oldPeerSet map[string]bool) {
+	if split < 0 {
+		split = 0
+	} else if split > len(peers) {
+		split = len(peers)
+	}
 	newPeers = peers[split:]
 	oldPeers = peers[:split]
 	newPeerSet = make(map[string]bool, len(newPeers))
