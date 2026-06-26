@@ -1070,6 +1070,22 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	}
 	c.mu.Unlock()
 
+	standalone := !s.JetStreamIsClustered() && s.standAloneMode()
+
+	// For a standalone server, enforce the system-wide total consumers limit.
+	isInternal := config.Direct || config.Sourcing
+	if !isRecovering && standalone && !isInternal {
+		maxConsumers := srvLim.MaxConsumersTotal
+		if maxConsumers > 0 {
+			js.mu.RLock()
+			atLimit := int(js.totalConsumers) >= maxConsumers
+			js.mu.RUnlock()
+			if atLimit {
+				return nil, NewJSMaximumConsumersLimitError()
+			}
+		}
+	}
+
 	// Hold mset lock here.
 	mset.mu.Lock()
 	if mset.client == nil || mset.store == nil || mset.consumers == nil {
@@ -1114,8 +1130,6 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		mset.mu.Unlock()
 		return nil, NewJSConsumerDoesNotExistError()
 	}
-
-	standalone := !s.JetStreamIsClustered() && s.standAloneMode()
 
 	// If we're clustered we've already done this check, only do this if we're a standalone server.
 	// But if we're standalone, only enforce if we're not recovering, since the MaxConsumers could've
@@ -1431,6 +1445,14 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 
 	mset.setConsumer(o)
 	mset.mu.Unlock()
+
+	// For a standalone server, account for this new consumer in the system-wide total.
+	// Direct/sourcing consumers are internal and don't count against asset totals.
+	if standalone && !isRecovering && !config.Direct && !config.Sourcing {
+		js.mu.Lock()
+		js.totalConsumers++
+		js.mu.Unlock()
+	}
 
 	if config.Sourcing && standalone {
 		o.resetStartingSeq(0, _EMPTY_, false)
@@ -6653,6 +6675,8 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 		ca = o.ca
 	}
 	js := o.js
+	// Direct/sourcing consumers are internal and don't count against asset totals.
+	isInternal := o.cfg.Direct || o.cfg.Sourcing
 	o.mu.Unlock()
 
 	if c != nil {
@@ -6667,12 +6691,22 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	}
 
 	var rp RetentionPolicy
+	var wasRegistered bool
 	if mset != nil {
 		mset.mu.Lock()
+		_, wasRegistered = mset.consumers[o.name]
 		mset.removeConsumer(o)
 		// No need for cfgMu's lock since mset.mu.Lock superseeds it.
 		rp = mset.cfg.Retention
 		mset.mu.Unlock()
+	}
+
+	// For a standalone server, account for this consumer delete in the system-wide total.
+	standalone := !o.srv.JetStreamIsClustered() && o.srv.standAloneMode()
+	if dflag && wasRegistered && standalone && !isInternal {
+		js.mu.Lock()
+		js.totalConsumers--
+		js.mu.Unlock()
 	}
 
 	// Cleanup messages that lost interest.

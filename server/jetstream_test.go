@@ -24441,3 +24441,71 @@ func TestJetStreamInterestStreamNoInterestSkipAdvancesLastTime(t *testing.T) {
 	t.Run("Memory", func(t *testing.T) { test(t, nats.MemoryStorage) })
 	t.Run("File", func(t *testing.T) { test(t, nats.FileStorage) })
 }
+
+func TestJetStreamAssetLimits(t *testing.T) {
+	storeDir := t.TempDir()
+	confFmt := `
+		listen: 127.0.0.1:-1
+		jetstream: {
+			store_dir: %q
+			limits: {
+				max_streams_total: %d
+				max_consumers_total: %d
+			}
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(confFmt, storeDir, 2, 2)))
+	s, _ := RunServerWithConfig(conf)
+	defer func() { s.Shutdown() }()
+
+	nc, js := jsClientConnect(t, s)
+
+	// Create streams and consumers up to the limit of 2 each.
+	_, err := js.AddStream(&nats.StreamConfig{Name: "S1", Subjects: []string{"S1.>"}})
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{Name: "S2", Subjects: []string{"S2.>"}})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("S1", &nats.ConsumerConfig{Durable: "C1", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("S1", &nats.ConsumerConfig{Durable: "C2", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	// Both limits are now reached, so creating more is rejected.
+	_, err = js.AddStream(&nats.StreamConfig{Name: "S3", Subjects: []string{"S3.>"}})
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "maximum number of streams reached")
+	_, err = js.AddConsumer("S1", &nats.ConsumerConfig{Durable: "C3", AckPolicy: nats.AckExplicitPolicy})
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "maximum consumers limit reached")
+	nc.Close()
+
+	// Restart with both limits lowered to 1. Recovery must repopulate the totals from the
+	// existing assets, so creating new ones is still rejected even though we exceed the limit.
+	s.Shutdown()
+	conf = createConfFile(t, []byte(fmt.Sprintf(confFmt, storeDir, 1, 1)))
+	s, _ = RunServerWithConfig(conf)
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		for _, name := range []string{"S1", "S2"} {
+			if _, err = js.StreamInfo(name); err != nil {
+				return err
+			}
+		}
+		for _, dur := range []string{"C1", "C2"} {
+			if _, err = js.ConsumerInfo("S1", dur); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	_, err = js.AddStream(&nats.StreamConfig{Name: "S3", Subjects: []string{"S3.>"}})
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "maximum number of streams reached")
+	_, err = js.AddConsumer("S1", &nats.ConsumerConfig{Durable: "C3", AckPolicy: nats.AckExplicitPolicy})
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "maximum consumers limit reached")
+}
