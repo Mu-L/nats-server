@@ -366,6 +366,13 @@ const JSMaxNameLen = 255
 // put on the global request queue before we react.
 const JSDefaultRequestQueueLimit = 10_000
 
+// JSDefaultMaxStreamsTotal and JSDefaultMaxConsumersTotal are the protective
+// system-wide defaults for the maximum number of streams and consumers.
+const (
+	JSDefaultMaxStreamsTotal   = 100_000
+	JSDefaultMaxConsumersTotal = 100_000
+)
+
 // Responses for API calls.
 
 // ApiResponse is a standard response from the JetStream JSON API

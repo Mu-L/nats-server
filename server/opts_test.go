@@ -77,6 +77,10 @@ func TestDefaultOptions(t *testing.T) {
 		SyncInterval:               2 * time.Minute,
 		JetStreamRequestQueueLimit: JSDefaultRequestQueueLimit,
 		JetStreamInfoQueueLimit:    JSDefaultRequestQueueLimit,
+		JetStreamLimits: JSLimitOpts{
+			MaxStreamsTotal:   JSDefaultMaxStreamsTotal,
+			MaxConsumersTotal: JSDefaultMaxConsumersTotal,
+		},
 	}
 
 	opts := &Options{}

@@ -6130,6 +6130,12 @@ func setBaselineOptions(opts *Options) {
 	if opts.JetStreamInfoQueueLimit <= 0 {
 		opts.JetStreamInfoQueueLimit = opts.JetStreamRequestQueueLimit
 	}
+	if opts.JetStreamLimits.MaxStreamsTotal == 0 {
+		opts.JetStreamLimits.MaxStreamsTotal = JSDefaultMaxStreamsTotal
+	}
+	if opts.JetStreamLimits.MaxConsumersTotal == 0 {
+		opts.JetStreamLimits.MaxConsumersTotal = JSDefaultMaxConsumersTotal
+	}
 }
 
 func getDefaultAuthTimeout(tls *tls.Config, tlsTimeout float64) float64 {
