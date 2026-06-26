@@ -462,6 +462,7 @@ type Options struct {
 	JetStreamMetaCompact       uint64
 	JetStreamMetaCompactSize   uint64
 	JetStreamMetaCompactSync   bool
+	JetStreamForwardAdvisories bool
 	StreamMaxBufferedMsgs      int               `json:"-"`
 	StreamMaxBufferedSize      int64             `json:"-"`
 	StoreDir                   string            `json:"-"`
@@ -2762,6 +2763,8 @@ func parseJetStream(v any, opts *Options, errors *[]error, warnings *[]error) er
 				opts.JetStreamMetaCompactSize = uint64(s)
 			case "meta_compact_sync":
 				opts.JetStreamMetaCompactSync = mv.(bool)
+			case "forward_advisories":
+				opts.JetStreamForwardAdvisories = mv.(bool)
 			default:
 				if !tk.IsUsedVariable() {
 					err := &unknownConfigFieldErr{
