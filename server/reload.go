@@ -1862,6 +1862,13 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			}
 		case "jetstreammetacompact", "jetstreammetacompactsize", "jetstreammetacompactsync":
 			// Allowed at runtime but monitorCluster looks at s.opts directly, so no further work needed here.
+		case "jetstreamconcurrentios":
+			// Not reloadable at runtime; permit the change only when JetStream
+			// is being disabled, e.g. the entire jetstream{} block being deleted.
+			if !disableJS {
+				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
+					field.Name, oldValue, newValue)
+			}
 		case "websocket":
 			// Similar to gateways
 			tmpOld := oldValue.(WebsocketOpts)
