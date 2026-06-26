@@ -10094,6 +10094,134 @@ func TestJetStreamDurableStreamMirrorRecreateAfterTeardown(t *testing.T) {
 	})
 }
 
+func TestJetStreamDurableStreamMirrorAckFCMismatchDefersPipeline(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "O",
+		Subjects: []string{"foo"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+
+	// Pre-create the durable consumer WITHOUT AckFlowControl, which durable mirroring requires.
+	_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver-subject",
+		AckPolicy:      AckExplicit,
+		Heartbeat:      time.Second,
+	}, false)
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("1"))
+	require_NoError(t, err)
+
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name: "M",
+		Mirror: &StreamSource{
+			Name:     "O",
+			Consumer: &StreamConsumerSource{Name: "C", DeliverSubject: "deliver-subject"},
+		},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("M")
+	require_NoError(t, err)
+
+	// Capture the durable subscription and the failure counter (fails > 0 means pipeline
+	// recreation is deferred until a reset succeeds).
+	state := func() (*subscription, int) {
+		mset.mu.RLock()
+		defer mset.mu.RUnlock()
+		require_NotNil(t, mset.mirror)
+		return mset.mirror.sub, mset.mirror.fails
+	}
+
+	// The mismatch must be reported, and the pipeline must be torn down and deferred.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("M")
+		if err != nil {
+			return err
+		}
+		if si.Mirror == nil || si.Mirror.Error == nil {
+			return errors.New("expected mirror error")
+		}
+		if si.Mirror.Error.Description != NewJSMirrorConsumerRequiresAckFCError().Description {
+			return si.Mirror.Error
+		}
+		if sub, fails := state(); sub != nil || fails == 0 {
+			return fmt.Errorf("expected torn down deferred pipeline, got sub!=nil=%v fails=%d", sub != nil, fails)
+		}
+		return nil
+	})
+
+	// Capture the message count once the pipeline is torn down. Across retries the pipeline must
+	// stay torn down (never optimistically recreated) and must not deliver through the invalid
+	// consumer, so the count must not grow.
+	si, err := js.StreamInfo("M")
+	require_NoError(t, err)
+	msgs0 := si.State.Msgs
+
+	for range 5 {
+		mset.mu.Lock()
+		mset.mirror.lreq = time.Time{}
+		mset.mirror.sip = false
+		mset.mu.Unlock()
+		require_NoError(t, mset.retryMirrorConsumer(false))
+		sub, fails := state()
+		require_True(t, sub == nil)
+		require_True(t, fails > 0)
+	}
+	si, err = js.StreamInfo("M")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, msgs0)
+
+	// Fix the consumer by recreating it with AckFlowControl.
+	require_NoError(t, js.DeleteConsumer("O", "C"))
+	_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver-subject",
+		AckPolicy:      AckFlowControl,
+		Heartbeat:      time.Second,
+	}, false)
+	require_NoError(t, err)
+
+	// On the next successful reset, the pipeline is stood up and the mirror recovers.
+	mset.mu.Lock()
+	mset.mirror.lreq = time.Time{}
+	mset.mirror.sip = false
+	mset.mu.Unlock()
+	require_NoError(t, mset.retryMirrorConsumer(false))
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if sub, fails := state(); sub == nil || fails != 0 {
+			return fmt.Errorf("expected rebuilt pipeline, got sub==nil=%v fails=%d", sub == nil, fails)
+		}
+		return nil
+	})
+
+	// And it keeps flowing, converging on all messages.
+	for i := 2; i <= 10; i++ {
+		_, err = js.Publish("foo", []byte(fmt.Sprintf("%d", i)))
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("M")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 10 {
+			return fmt.Errorf("expected 10 msgs, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+}
+
 func TestJetStreamDurableStreamSourcePreExistingSub(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -10298,6 +10426,146 @@ func TestJetStreamDurableStreamSourceRecreateAfterTeardown(t *testing.T) {
 	})
 
 	// And the source resumes delivery.
+	for i := 2; i <= 10; i++ {
+		_, err = js.Publish("foo", []byte(fmt.Sprintf("%d", i)))
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 10 {
+			return fmt.Errorf("expected 10 msgs, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamDurableStreamSourceAckFCMismatchDefersPipeline(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "O",
+		Subjects: []string{"foo"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+
+	// Pre-create the durable consumer WITHOUT AckFlowControl, which durable sourcing requires.
+	_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver-subject",
+		AckPolicy:      AckExplicit,
+		Heartbeat:      time.Second,
+	}, false)
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("1"))
+	require_NoError(t, err)
+
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name: "S",
+		Sources: []*StreamSource{{
+			Name:     "O",
+			Consumer: &StreamConsumerSource{Name: "C", DeliverSubject: "deliver-subject"},
+		}},
+		Storage: FileStorage,
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("S")
+	require_NoError(t, err)
+
+	// Resolve the single source's index name.
+	var iname string
+	mset.mu.RLock()
+	for name := range mset.sources {
+		iname = name
+	}
+	mset.mu.RUnlock()
+	require_NotEqual(t, iname, _EMPTY_)
+
+	// Capture the durable subscription and the failure counter (fails > 0 means pipeline
+	// recreation is deferred until a reset succeeds).
+	state := func() (*subscription, int) {
+		mset.mu.RLock()
+		defer mset.mu.RUnlock()
+		si := mset.sources[iname]
+		require_NotNil(t, si)
+		return si.sub, si.fails
+	}
+
+	// The mismatch must be reported, and the pipeline must be torn down and deferred.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return err
+		}
+		if len(si.Sources) != 1 || si.Sources[0].Error == nil {
+			return errors.New("expected source error")
+		}
+		if si.Sources[0].Error.Description != NewJSSourceConsumerRequiresAckFCError().Description {
+			return si.Sources[0].Error
+		}
+		if sub, fails := state(); sub != nil || fails == 0 {
+			return fmt.Errorf("expected torn down deferred pipeline, got sub!=nil=%v fails=%d", sub != nil, fails)
+		}
+		return nil
+	})
+
+	// Capture the message count once the pipeline is torn down. Across retries the pipeline must
+	// stay torn down (never optimistically recreated) and must not deliver through the invalid
+	// consumer, so the count must not grow.
+	si, err := js.StreamInfo("S")
+	require_NoError(t, err)
+	msgs0 := si.State.Msgs
+
+	for range 5 {
+		mset.mu.Lock()
+		src := mset.sources[iname]
+		src.lreq = time.Time{}
+		src.sip = false
+		mset.trySetupSourceConsumer(iname, src.sseq+1, time.Time{}, false)
+		mset.mu.Unlock()
+		sub, fails := state()
+		require_True(t, sub == nil)
+		require_True(t, fails > 0)
+	}
+	si, err = js.StreamInfo("S")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, msgs0)
+
+	// Fix the consumer by recreating it with AckFlowControl.
+	require_NoError(t, js.DeleteConsumer("O", "C"))
+	_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+		Durable:        "C",
+		DeliverSubject: "deliver-subject",
+		AckPolicy:      AckFlowControl,
+		Heartbeat:      time.Second,
+	}, false)
+	require_NoError(t, err)
+
+	// On the next successful reset, the pipeline is stood up and the source recovers.
+	mset.mu.Lock()
+	src := mset.sources[iname]
+	src.lreq = time.Time{}
+	src.sip = false
+	mset.trySetupSourceConsumer(iname, src.sseq+1, time.Time{}, false)
+	mset.mu.Unlock()
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if sub, fails := state(); sub == nil || fails != 0 {
+			return fmt.Errorf("expected rebuilt pipeline, got sub==nil=%v fails=%d", sub == nil, fails)
+		}
+		return nil
+	})
+
+	// And it keeps flowing, converging on all messages.
 	for i := 2; i <= 10; i++ {
 		_, err = js.Publish("foo", []byte(fmt.Sprintf("%d", i)))
 		require_NoError(t, err)

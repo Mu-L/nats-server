@@ -3664,8 +3664,9 @@ func (mset *stream) setupMirrorConsumer() error {
 	mirror.sip = true
 
 	if durable {
-		// Stand up the durable subscription and its processing goroutine up front.
-		if mirror.sub == nil {
+		// Optimistically stand up the durable subscription and shared processing goroutine up front.
+		// If it was closed as part of a request failure, only recreate after a successful response.
+		if mirror.sub == nil && mirror.fails == 0 {
 			if err = mset.createMirrorPipeline(mirror, durableDeliverSubject); err != nil {
 				mirror.err = NewJSMirrorConsumerSetupFailedError(err, Unless(err))
 				mirror.sip = false
@@ -3793,6 +3794,7 @@ func (mset *stream) setupMirrorConsumer() error {
 			// If using durable sourcing, we need the consumer to use acks based on flow control.
 			if durableDeliverSubject != _EMPTY_ && ccr.ConsumerInfo.Config.AckPolicy != AckFlowControl {
 				mset.unsubscribe(crSub)
+				mset.cancelSourceInfo(mirror)
 				mirror.err = NewJSMirrorConsumerRequiresAckFCError()
 				retry = true
 				mset.mu.Unlock()
@@ -3842,7 +3844,26 @@ func (mset *stream) setupMirrorConsumer() error {
 			}
 
 			if durable {
-				// The subscription and goroutine already exist, only raise the stream sequence.
+				// If the pipeline was deferred (e.g. after an AckFlowControl mismatch), stand it
+				// up now that we have a successful response.
+				if mirror.sub == nil {
+					if err = mset.createMirrorPipeline(mirror, durableDeliverSubject); err != nil {
+						mirror.err = NewJSMirrorConsumerSetupFailedError(err, Unless(err))
+						retry = true
+						mset.mu.Unlock()
+						return
+					}
+					// Baseline the stream sequence to our applied position; from here it is
+					// monotonic and owned by the per-message logic (never lowered on reset).
+					mirror.sseq = mset.lseq
+					mirror.qch = make(chan struct{})
+					mirror.wg.Add(1)
+					// As in the optimistic path, we don't ready.Wait(): the durable goroutine is
+					// started once and kept alive across resets.
+					ready.Add(1)
+					mset.createMirrorRoutine(mirror, &ready)
+				}
+				// The subscription and goroutine exist now, only raise the stream sequence.
 				mirror.sseq = max(mirror.sseq, ccr.ConsumerInfo.Delivered.Stream)
 				mset.mu.Unlock()
 			} else {
@@ -4154,8 +4175,9 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 	si.sip = true
 
 	if durable {
-		// Stand up the durable subscription and shared processing goroutine up front.
-		if si.sub == nil {
+		// Optimistically stand up the durable subscription and shared processing goroutine up front.
+		// If it was closed as part of a request failure, only recreate after a successful response.
+		if si.sub == nil && si.fails == 0 {
 			if err = mset.createSourcePipeline(si, durableDeliverSubject); err != nil {
 				si.err = NewJSSourceConsumerSetupFailedError(err, Unless(err))
 				si.sip = false
@@ -4258,6 +4280,7 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 				// If using durable sourcing, we need the consumer to use acks based on flow control.
 				if durableDeliverSubject != _EMPTY_ && ccr.ConsumerInfo.Config.AckPolicy != AckFlowControl {
 					mset.unsubscribe(crSub)
+					mset.cancelSourceInfo(si)
 					si.err = NewJSSourceConsumerRequiresAckFCError()
 					retry = true
 					mset.mu.Unlock()
@@ -4268,7 +4291,19 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 				mset.unsubscribe(crSub)
 
 				if durable {
-					// The subscription and shared goroutine already exist, only raise the stream sequence.
+					// If the pipeline was deferred (e.g. after an AckFlowControl mismatch), stand
+					// it up now that we have a successful response.
+					if si.sub == nil {
+						if err = mset.createSourcePipeline(si, durableDeliverSubject); err != nil {
+							si.err = NewJSSourceConsumerSetupFailedError(err, Unless(err))
+							retry = true
+							mset.mu.Unlock()
+							return
+						}
+						si.qch = make(chan struct{})
+						si.last.Store(time.Now().UnixNano())
+					}
+					// The subscription and shared goroutine exist now, only raise the stream sequence.
 					si.sseq = max(si.sseq, ccr.ConsumerInfo.Delivered.Stream)
 				} else {
 					// Setup actual subscription to process messages from our source.
